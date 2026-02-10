@@ -3,7 +3,7 @@ aiohttp>=3.8.0
 pytz>=2023.3
 geopy==2.4.1
 deep-translator==1.11.4
-timezonefinder==6.2.0
+timezonefinder>=5.0,<6
 openai>=1.0.0
 replicate>=0.25.0
 SpeechRecognition>=3.10.0
