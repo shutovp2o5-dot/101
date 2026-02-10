@@ -1766,11 +1766,17 @@ def load_module(module_path: str, module_name: str) -> Optional[Any]:
 
 def main():
     """Основная функция запуска объединенного бота"""
-    # Загружаем токен из .env
+    # Загружаем токен из .env (локально) или из переменных окружения (Railway и т.п.)
     env_file = os.path.join(os.path.dirname(__file__), '.env')
     load_env_file(env_file)
     
-    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    token = os.getenv('TELEGRAM_BOT_TOKEN') or os.environ.get('TELEGRAM_BOT_TOKEN')
+    
+    # Диагностика: какие переменные с TELEGRAM видны (без вывода значения токена)
+    telegram_vars = [k for k in os.environ if 'TELEGRAM' in k.upper()]
+    logger.info(f"Переменные окружения с TELEGRAM: {telegram_vars if telegram_vars else 'нет'}")
+    if token:
+        logger.info(f"TELEGRAM_BOT_TOKEN найден, длина: {len(token)}")
     
     if not token:
         logger.error("Не указан TELEGRAM_BOT_TOKEN!")
