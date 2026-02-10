@@ -1,0 +1,61 @@
+{
+  "376922618": [
+    {
+      "title": "Звонок — Comms🗞",
+      "date": "2026-01-19",
+      "time": "13:30",
+      "description": "https://1f-vconf.v-a-c.org/user2633",
+      "category": "ges2",
+      "repeat_type": "once",
+      "reminders": [],
+      "id": "1705668600.0",
+      "created_at": "2026-01-16T14:00:00.000000"
+    },
+    {
+      "title": "Звонок — Prod⚙️",
+      "date": "2026-01-20",
+      "time": "15:00",
+      "description": "https://1f.v-a-c.org/conference/?room=user2480",
+      "category": "ges2",
+      "repeat_type": "once",
+      "reminders": [],
+      "id": "1705755600.0",
+      "created_at": "2026-01-16T14:00:00.000000"
+    },
+    {
+      "title": "Лекция Саши Гачкова",
+      "date": "2026-01-21",
+      "time": "19:30",
+      "description": "",
+      "category": "kinora",
+      "repeat_type": "once",
+      "reminders": [],
+      "id": "1705852200.0",
+      "created_at": "2026-01-16T14:00:00.000000"
+    },
+    {
+      "title": "Опубликовать пост про тур Солодникова",
+      "date": "2026-01-23",
+      "time": "10:00",
+      "description": "",
+      "category": "curatorial",
+      "repeat_type": "once",
+      "reminders": [],
+      "id": "1768587094.784388",
+      "created_at": "2026-01-16T21:11:34.785894"
+    },
+    {
+      "title": "Встреча с Юлей М.",
+      "date": "2026-01-19",
+      "time": "14:00",
+      "description": "Ленфильм",
+      "category": "curatorial",
+      "repeat_type": "once",
+      "reminders": [
+        60
+      ],
+      "id": "1768771598.448008",
+      "created_at": "2026-01-19T00:26:38.448023"
+    }
+  ]
+}

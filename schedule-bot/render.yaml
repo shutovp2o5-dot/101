@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: telegram-schedule-bot
+    env: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python3 bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false

@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Schedule Bot
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/path/to/telegram-schedule-bot
+Environment="TELEGRAM_BOT_TOKEN=your_token_here"
+ExecStart=/usr/bin/python3 /path/to/telegram-schedule-bot/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

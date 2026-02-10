@@ -1,0 +1,7 @@
+python-telegram-bot==20.7
+aiohttp>=3.8.0
+openai>=1.0.0
+replicate>=0.25.0
+SpeechRecognition>=3.10.0
+pydub>=0.25.1
+pytz>=2023.3
