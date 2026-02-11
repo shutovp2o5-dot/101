@@ -1396,15 +1396,13 @@ async def show_tasks_management_from_plan(update: Update, context: ContextTypes.
         
         # Формируем список задач с кнопками для отметки
         text = "<b>✅ Управление задачами</b>\n\n"
-        text += "Нажмите на задачу, чтобы отметить её как выполненную или невыполненную:\n\n"
+        text += "Нажмите на задачу: выполнить, редактировать (название или время) или вернуться.\n\n"
         
         keyboard = []
         
-        # Сортируем задачи: сначала невыполненные, потом выполненные
+        # Показываем только невыполненные задачи
         incomplete_tasks = [t for t in tasks if not t.get('completed', False)]
-        completed_tasks = [t for t in tasks if t.get('completed', False)]
         
-        # Показываем невыполненные задачи
         for i, task in enumerate(incomplete_tasks[:50], 1):  # Ограничиваем до 50 задач
             title = task.get('title', 'Без названия')
             task_id = task.get('id', '')
@@ -1434,24 +1432,6 @@ async def show_tasks_management_from_plan(update: Update, context: ContextTypes.
                 button_text = button_text[:57] + "..."
             
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"plan_task_complete_{task_id}")])
-        
-        # Показываем выполненные задачи (с отметкой)
-        if completed_tasks:
-            keyboard.append([InlineKeyboardButton("━━━ Выполненные ━━━", callback_data="plan_tasks_completed_header")])
-            for i, task in enumerate(completed_tasks[:30], 1):  # Ограничиваем до 30 выполненных
-                title = task.get('title', 'Без названия')
-                task_id = task.get('id', '')
-                project = task.get('project', '')
-                
-                button_text = f"✓ {title}"
-                if project:
-                    button_text += f" [{project}]"
-                
-                # Обрезаем текст кнопки
-                if len(button_text) > 60:
-                    button_text = button_text[:57] + "..."
-                
-                keyboard.append([InlineKeyboardButton(button_text, callback_data=f"plan_task_complete_{task_id}")])
         
         keyboard.append([InlineKeyboardButton("◀️ Назад к плану", callback_data="plan_back_to_plan")])
         
@@ -3370,44 +3350,92 @@ def main():
             
             completed = task.get('completed', False)
             task_title = task.get('title', 'Без названия')
+            deadline = task.get('deadline', '')
+            deadline_str = ''
+            if deadline:
+                try:
+                    if 'T' in deadline:
+                        deadline_dt = datetime.fromisoformat(deadline.replace('Z', '+00:00'))
+                        deadline_str = deadline_dt.strftime('%d.%m %H:%M')
+                    else:
+                        deadline_dt = datetime.strptime(deadline, '%Y-%m-%d')
+                        deadline_str = deadline_dt.strftime('%d.%m')
+                except Exception:
+                    pass
             
+            # Меню задачи: Выполнить / Редактировать / Назад
             if completed:
-                # Задача выполнена - предлагаем отметить как невыполненную
                 keyboard = [
-                    [InlineKeyboardButton("Да, отметить как невыполненную", callback_data=f"plan_task_uncomplete_{task_id}")],
-                    [InlineKeyboardButton("Отмена", callback_data="plan_back_to_tasks")]
+                    [InlineKeyboardButton("↩️ Отметить как невыполненную", callback_data=f"plan_task_uncomplete_{task_id}")],
+                    [InlineKeyboardButton("✏️ Редактировать", callback_data=f"plan_task_edit_{task_id}")],
+                    [InlineKeyboardButton("◀️ Назад к списку", callback_data="plan_back_to_tasks")]
                 ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(
-                    f"Задача: <b>{task_title}</b>\n\n"
-                    "Отметить как невыполненную?",
-                    parse_mode='HTML',
-                    reply_markup=reply_markup
-                )
             else:
-                # Задача не выполнена - используем стандартный процесс из tasks_module
-                # Сохраняем информацию о том, что мы в режиме плана
-                context.user_data['from_plan'] = True
-                context.user_data['task_id'] = task_id
-                context.user_data['task_title'] = task_title
-                
-                # Показываем вопрос "готово?"
                 keyboard = [
-                    [InlineKeyboardButton("Да", callback_data="plan_task_confirm_yes")],
-                    [InlineKeyboardButton("Нет", callback_data="plan_task_confirm_no")]
+                    [InlineKeyboardButton("✅ Выполнить", callback_data=f"plan_task_do_complete_{task_id}")],
+                    [InlineKeyboardButton("✏️ Редактировать", callback_data=f"plan_task_edit_{task_id}")],
+                    [InlineKeyboardButton("◀️ Назад к списку", callback_data="plan_back_to_tasks")]
                 ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(
-                    f"Задача: <b>{task_title}</b>\n\n"
-                    "Готово?",
-                    parse_mode='HTML',
-                    reply_markup=reply_markup
-                )
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            task_info = f"<b>{task_title}</b>"
+            if deadline_str:
+                task_info += f" ({deadline_str})"
+            await query.edit_message_text(
+                f"Задача: {task_info}\n\nЧто сделать?",
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
         except Exception as e:
             logger.error(f"Ошибка в plan_task_complete_callback: {e}", exc_info=True)
             try:
                 if update.callback_query:
                     await update.callback_query.answer("❌ Произошла ошибка", show_alert=True)
+            except Exception:
+                pass
+    
+    async def plan_task_do_complete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Кнопка «Выполнить» — показать подтверждение"""
+        try:
+            query = update.callback_query
+            if not query:
+                return
+            await query.answer()
+            task_id = query.data.replace("plan_task_do_complete_", "")
+            user_id = query.from_user.id
+            tasks_module = context.application.bot_data.get('tasks_module')
+            if not tasks_module:
+                await query.edit_message_text("❌ Модуль задач недоступен")
+                return
+            task = None
+            if hasattr(tasks_module, 'get_user_task_by_id'):
+                try:
+                    task = tasks_module.get_user_task_by_id(str(user_id), task_id)
+                except Exception:
+                    pass
+            if not task and hasattr(tasks_module, 'get_user_tasks'):
+                tasks = tasks_module.get_user_tasks(str(user_id))
+                if isinstance(tasks, list):
+                    task = next((t for t in tasks if isinstance(t, dict) and t.get('id') == task_id), None)
+            if not task:
+                await query.answer("Задача не найдена", show_alert=True)
+                return
+            context.user_data['from_plan'] = True
+            context.user_data['task_id'] = task_id
+            context.user_data['task_title'] = task.get('title', 'Без названия')
+            keyboard = [
+                [InlineKeyboardButton("Да", callback_data="plan_task_confirm_yes")],
+                [InlineKeyboardButton("Нет", callback_data="plan_task_confirm_no")]
+            ]
+            await query.edit_message_text(
+                f"Задача: <b>{context.user_data['task_title']}</b>\n\nГотово?",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            logger.error(f"Ошибка в plan_task_do_complete_callback: {e}", exc_info=True)
+            try:
+                if update.callback_query:
+                    await update.callback_query.answer("❌ Ошибка", show_alert=True)
             except Exception:
                 pass
     
@@ -3539,6 +3567,180 @@ def main():
             except Exception:
                 pass
     
+    async def plan_task_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Меню редактирования задачи: название или время"""
+        try:
+            query = update.callback_query
+            if not query:
+                return
+            await query.answer()
+            task_id = query.data.replace("plan_task_edit_", "")
+            user_id = query.from_user.id
+            tasks_module = context.application.bot_data.get('tasks_module')
+            if not tasks_module:
+                await query.edit_message_text("❌ Модуль задач недоступен")
+                return
+            task = None
+            if hasattr(tasks_module, 'get_user_task_by_id'):
+                try:
+                    task = tasks_module.get_user_task_by_id(str(user_id), task_id)
+                except Exception:
+                    pass
+            if not task and hasattr(tasks_module, 'get_user_tasks'):
+                tasks = tasks_module.get_user_tasks(str(user_id))
+                if isinstance(tasks, list):
+                    task = next((t for t in tasks if isinstance(t, dict) and t.get('id') == task_id), None)
+            if not task:
+                await query.answer("Задача не найдена", show_alert=True)
+                return
+            context.user_data['plan_edit_task_id'] = task_id
+            title = task.get('title', 'Без названия')
+            keyboard = [
+                [InlineKeyboardButton("📝 Изменить название", callback_data=f"plan_edit_title_{task_id}")],
+                [InlineKeyboardButton("📅 Перенести время", callback_data=f"plan_edit_deadline_{task_id}")],
+                [InlineKeyboardButton("◀️ Назад к списку", callback_data="plan_edit_back")]
+            ]
+            await query.edit_message_text(
+                f"Редактирование: <b>{title}</b>\n\nЧто изменить?",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            logger.error(f"Ошибка в plan_task_edit_callback: {e}", exc_info=True)
+            try:
+                if update.callback_query:
+                    await update.callback_query.answer("❌ Ошибка", show_alert=True)
+            except Exception:
+                pass
+    
+    async def plan_edit_title_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Запрос нового названия задачи"""
+        try:
+            query = update.callback_query
+            if not query:
+                return
+            await query.answer()
+            task_id = query.data.replace("plan_edit_title_", "")
+            context.user_data['plan_edit_task_id'] = task_id
+            context.user_data['plan_waiting'] = 'plan_edit_title'
+            await query.edit_message_text("Введите новое название задачи:")
+        except Exception as e:
+            logger.error(f"Ошибка в plan_edit_title_prompt_callback: {e}", exc_info=True)
+    
+    async def plan_edit_deadline_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Запрос новой даты/времени"""
+        try:
+            query = update.callback_query
+            if not query:
+                return
+            await query.answer()
+            task_id = query.data.replace("plan_edit_deadline_", "")
+            context.user_data['plan_edit_task_id'] = task_id
+            context.user_data['plan_waiting'] = 'plan_edit_deadline'
+            await query.edit_message_text(
+                "Введите новую дату или время.\n\n"
+                "Например: завтра 18:00, 15.02.2026, послезавтра утра, через 2 дня"
+            )
+        except Exception as e:
+            logger.error(f"Ошибка в plan_edit_deadline_prompt_callback: {e}", exc_info=True)
+    
+    async def plan_edit_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Назад из меню редактирования к списку задач"""
+        try:
+            query = update.callback_query
+            if not query:
+                return
+            await query.answer()
+            context.user_data.pop('plan_edit_task_id', None)
+            context.user_data.pop('plan_waiting', None)
+            await show_tasks_management_from_plan_callback(query, context)
+        except Exception as e:
+            logger.error(f"Ошибка в plan_edit_back_callback: {e}", exc_info=True)
+    
+    async def plan_edit_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка ввода нового названия или даты при редактировании задачи из плана"""
+        if not update.message or not update.message.text:
+            return
+        waiting = context.user_data.get('plan_waiting')
+        if waiting not in ('plan_edit_title', 'plan_edit_deadline'):
+            return
+        task_id = context.user_data.get('plan_edit_task_id')
+        if not task_id:
+            context.user_data.pop('plan_waiting', None)
+            return
+        user_id = update.effective_user.id
+        tasks_module = context.application.bot_data.get('tasks_module')
+        if not tasks_module or not hasattr(tasks_module, 'update_user_task'):
+            await update.message.reply_text("❌ Модуль задач недоступен")
+            context.user_data.pop('plan_waiting', None)
+            context.user_data.pop('plan_edit_task_id', None)
+            return
+        text = update.message.text.strip()
+        if not text:
+            await update.message.reply_text("Введите непустой текст.")
+            return
+        try:
+            if waiting == 'plan_edit_title':
+                tasks_module.update_user_task(str(user_id), task_id, {'title': text})
+                await update.message.reply_text(f"✅ Название изменено на: <b>{text}</b>", parse_mode='HTML')
+            else:
+                if hasattr(tasks_module, 'parse_deadline'):
+                    deadline_dt = tasks_module.parse_deadline(text, None)
+                else:
+                    deadline_dt = None
+                if deadline_dt is None:
+                    await update.message.reply_text(
+                        "Не удалось распознать дату/время. Попробуйте: завтра 18:00, 15.02.2026, послезавтра"
+                    )
+                    return
+                tasks_module.update_user_task(str(user_id), task_id, {'deadline': deadline_dt.isoformat()})
+                if hasattr(tasks_module, 'format_deadline_readable'):
+                    formatted = tasks_module.format_deadline_readable(deadline_dt)
+                else:
+                    formatted = deadline_dt.strftime('%d.%m.%Y %H:%M')
+                await update.message.reply_text(f"✅ Время изменено на: <b>{formatted}</b>", parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении редактирования задачи: {e}", exc_info=True)
+            await update.message.reply_text("❌ Ошибка при сохранении.")
+        context.user_data.pop('plan_waiting', None)
+        context.user_data.pop('plan_edit_task_id', None)
+        # Отправляем обновлённый список задач
+        try:
+            tasks = tasks_module.get_user_tasks(str(user_id)) if hasattr(tasks_module, 'get_user_tasks') else []
+            if tasks:
+                msg_text = "<b>✅ Управление задачами</b>\n\nНажмите на задачу:\n\n"
+                keyboard = []
+                incomplete = [t for t in tasks if not t.get('completed', False)]
+                for i, task in enumerate(incomplete[:50], 1):
+                    title = task.get('title', 'Без названия')
+                    tid = task.get('id', '')
+                    deadline = task.get('deadline', '')
+                    project = task.get('project', '')
+                    btn = f"{i}. {title}"
+                    if deadline:
+                        try:
+                            if 'T' in deadline:
+                                dt = datetime.fromisoformat(deadline.replace('Z', '+00:00'))
+                                btn += f" ({dt.strftime('%d.%m %H:%M')})"
+                            else:
+                                dt = datetime.strptime(deadline, '%Y-%m-%d')
+                                btn += f" ({dt.strftime('%d.%m')})"
+                        except Exception:
+                            pass
+                    if project:
+                        btn += f" [{project}]"
+                    if len(btn) > 60:
+                        btn = btn[:57] + "..."
+                    keyboard.append([InlineKeyboardButton(btn, callback_data=f"plan_task_complete_{tid}")])
+                keyboard.append([InlineKeyboardButton("◀️ Назад к плану", callback_data="plan_back_to_plan")])
+                await update.message.reply_text(
+                    msg_text,
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+        except Exception as e:
+            logger.debug(f"Не удалось отправить список задач после редактирования: {e}")
+    
     async def plan_back_to_tasks_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Возврат к списку задач из плана"""
         try:
@@ -3596,15 +3798,13 @@ def main():
             
             # Формируем список задач с кнопками для отметки
             text = "<b>✅ Управление задачами</b>\n\n"
-            text += "Нажмите на задачу, чтобы отметить её как выполненную или невыполненную:\n\n"
+            text += "Нажмите на задачу: выполнить, редактировать (название или время) или вернуться.\n\n"
             
             keyboard = []
             
-            # Сортируем задачи: сначала невыполненные, потом выполненные
+            # Показываем только невыполненные задачи
             incomplete_tasks = [t for t in tasks if not t.get('completed', False)]
-            completed_tasks = [t for t in tasks if t.get('completed', False)]
             
-            # Показываем невыполненные задачи
             for i, task in enumerate(incomplete_tasks[:50], 1):  # Ограничиваем до 50 задач
                 if not isinstance(task, dict):
                     continue
@@ -3641,31 +3841,6 @@ def main():
                     button_text = button_text[:57] + "..."
                 
                 keyboard.append([InlineKeyboardButton(button_text, callback_data=f"plan_task_complete_{task_id}")])
-            
-            # Показываем выполненные задачи (с отметкой)
-            if completed_tasks:
-                keyboard.append([InlineKeyboardButton("━━━ Выполненные ━━━", callback_data="plan_tasks_completed_header")])
-                for i, task in enumerate(completed_tasks[:30], 1):  # Ограничиваем до 30 выполненных
-                    if not isinstance(task, dict):
-                        continue
-                    
-                    title = task.get('title', 'Без названия')
-                    task_id = task.get('id', '')
-                    project = task.get('project', '')
-                    
-                    if not task_id:
-                        logger.warning(f"Выполненная задача без ID пропущена: {title}")
-                        continue
-                    
-                    button_text = f"✓ {title}"
-                    if project:
-                        button_text += f" [{project}]"
-                    
-                    # Обрезаем текст кнопки
-                    if len(button_text) > 60:
-                        button_text = button_text[:57] + "..."
-                    
-                    keyboard.append([InlineKeyboardButton(button_text, callback_data=f"plan_task_complete_{task_id}")])
             
             keyboard.append([InlineKeyboardButton("◀️ Назад к плану", callback_data="plan_back_to_plan")])
             
@@ -3737,12 +3912,32 @@ def main():
         pattern='^plan_task_complete_'
     ))
     application.add_handler(CallbackQueryHandler(
+        plan_task_do_complete_callback,
+        pattern='^plan_task_do_complete_'
+    ))
+    application.add_handler(CallbackQueryHandler(
         plan_task_confirm_yes_callback,
         pattern='^plan_task_confirm_yes$'
     ))
     application.add_handler(CallbackQueryHandler(
         plan_task_confirm_no_callback,
         pattern='^plan_task_confirm_no$'
+    ))
+    application.add_handler(CallbackQueryHandler(
+        plan_task_edit_callback,
+        pattern='^plan_task_edit_'
+    ))
+    application.add_handler(CallbackQueryHandler(
+        plan_edit_title_prompt_callback,
+        pattern='^plan_edit_title_'
+    ))
+    application.add_handler(CallbackQueryHandler(
+        plan_edit_deadline_prompt_callback,
+        pattern='^plan_edit_deadline_'
+    ))
+    application.add_handler(CallbackQueryHandler(
+        plan_edit_back_callback,
+        pattern='^plan_edit_back$'
     ))
     application.add_handler(CallbackQueryHandler(
         plan_task_uncomplete_callback,
@@ -3759,6 +3954,20 @@ def main():
     application.add_handler(CallbackQueryHandler(
         plan_tasks_completed_header_callback,
         pattern='^plan_tasks_completed_header$'
+    ))
+    # Ввод названия/даты при редактировании задачи из плана (только когда ждём ввод)
+    class PlanEditWaitingFilter(filters.UpdateFilter):
+        def __init__(self, app, **kwargs):
+            super().__init__(**kwargs)
+            self._app = app
+        def filter(self, update):
+            if not update.message or not update.message.text or not update.effective_user:
+                return False
+            ud = self._app.user_data.get(update.effective_user.id, {})
+            return ud.get('plan_waiting') in ('plan_edit_title', 'plan_edit_deadline')
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & PlanEditWaitingFilter(application),
+        plan_edit_message_handler
     ))
     
     # Обработчик ошибок
