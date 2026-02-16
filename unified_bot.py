@@ -144,7 +144,7 @@ def get_plan_keyboard():
         [KeyboardButton("📅 План на сегодня"), KeyboardButton("📅 План на завтра")],
         [KeyboardButton("📅 План на неделю"), KeyboardButton("📅 План на месяц")],
         [KeyboardButton("📅 План на год"), KeyboardButton("📅 План на 3 года")],
-        [KeyboardButton("✅ Управление задачами")],
+        [KeyboardButton("✅ Управление задачами"), KeyboardButton("✏️ Редактировать события")],
         [KeyboardButton("🏠 Главное меню")]
     ], resize_keyboard=True)
 
@@ -385,7 +385,7 @@ async def unified_add_deadline(update: Update, context: ContextTypes.DEFAULT_TYP
                 # parse_deadline(text, deadline=None) -> datetime | None
                 deadline_dt = tasks_module.parse_deadline(text, None)
                 if not deadline_dt:
-                    await update.message.reply_text("Не понял дедлайн. Попробуйте другой формат (например, «сегодня 18:00»).")
+                    await update.message.reply_text("Не понял дедлайн. Попробуйте другой формат (например, «сегодня 18:00» или «вторник 14:00»).")
                     return WAITING_UNIFIED_DEADLINE
                 if deadline_dt.tzinfo:
                     deadline_dt = deadline_dt.replace(tzinfo=None)
@@ -1005,14 +1005,10 @@ def format_combined_plan_text(events: List[Dict], tasks: List[Dict], period_name
     
     # Выводим объединенный план по датам
     try:
-        # Вспомогательная функция для очистки служебного эмодзи из названия
+        # Вспомогательная функция для возможной очистки служебных символов из названия
         def _clean_title(title: str) -> str:
             if not isinstance(title, str):
                 return title
-            if title.startswith('🪡 '):
-                return title[2:]
-            if title.startswith('🪡'):
-                return title[1:]
             return title
         
         first_date = True
@@ -1431,7 +1427,11 @@ async def show_tasks_management_from_plan(update: Update, context: ContextTypes.
             if len(button_text) > 60:
                 button_text = button_text[:57] + "..."
             
-            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"plan_task_complete_{task_id}")])
+            # Задача: открыть меню | кнопка «Время» — сразу редактировать дату/время
+            keyboard.append([
+                InlineKeyboardButton(button_text, callback_data=f"plan_task_complete_{task_id}"),
+                InlineKeyboardButton("📅 Время", callback_data=f"plan_edit_deadline_{task_id}")
+            ])
         
         keyboard.append([InlineKeyboardButton("◀️ Назад к плану", callback_data="plan_back_to_plan")])
         
@@ -2649,6 +2649,11 @@ def main():
                     filters.Regex('^✏️\s*$'),
                     create_schedule_wrapper(schedule_module.edit_events_list)
                 ))
+                # Из раздела «План» можно перейти к редактированию событий/встреч
+                application.add_handler(MessageHandler(
+                    filters.Regex('^✏️ Редактировать события$'),
+                    create_schedule_wrapper(schedule_module.edit_events_list)
+                ))
             if hasattr(schedule_module, 'clear_messages'):
                 application.add_handler(MessageHandler(
                     filters.Regex('^🙈\s*$'),
@@ -3363,17 +3368,17 @@ def main():
                 except Exception:
                     pass
             
-            # Меню задачи: Выполнить / Редактировать / Назад
+            # Меню задачи: Выполнить / Редактировать / Удалить / Назад
             if completed:
                 keyboard = [
                     [InlineKeyboardButton("↩️ Отметить как невыполненную", callback_data=f"plan_task_uncomplete_{task_id}")],
-                    [InlineKeyboardButton("✏️ Редактировать", callback_data=f"plan_task_edit_{task_id}")],
+                    [InlineKeyboardButton("✏️ Редактировать", callback_data=f"plan_task_edit_{task_id}"), InlineKeyboardButton("🗑 Удалить", callback_data=f"plan_task_delete_{task_id}")],
                     [InlineKeyboardButton("◀️ Назад к списку", callback_data="plan_back_to_tasks")]
                 ]
             else:
                 keyboard = [
                     [InlineKeyboardButton("✅ Выполнить", callback_data=f"plan_task_do_complete_{task_id}")],
-                    [InlineKeyboardButton("✏️ Редактировать", callback_data=f"plan_task_edit_{task_id}")],
+                    [InlineKeyboardButton("✏️ Редактировать", callback_data=f"plan_task_edit_{task_id}"), InlineKeyboardButton("🗑 Удалить", callback_data=f"plan_task_delete_{task_id}")],
                     [InlineKeyboardButton("◀️ Назад к списку", callback_data="plan_back_to_tasks")]
                 ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -3639,7 +3644,7 @@ def main():
             context.user_data['plan_waiting'] = 'plan_edit_deadline'
             await query.edit_message_text(
                 "Введите новую дату или время.\n\n"
-                "Например: завтра 18:00, 15.02.2026, послезавтра утра, через 2 дня"
+                "Например: завтра 18:00, вторник 14:00, 15.02.2026, послезавтра, через 2 дня"
             )
         except Exception as e:
             logger.error(f"Ошибка в plan_edit_deadline_prompt_callback: {e}", exc_info=True)
@@ -3656,6 +3661,31 @@ def main():
             await show_tasks_management_from_plan_callback(query, context)
         except Exception as e:
             logger.error(f"Ошибка в plan_edit_back_callback: {e}", exc_info=True)
+    
+    async def plan_task_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Удаление задачи из плана"""
+        try:
+            query = update.callback_query
+            if not query:
+                return
+            await query.answer()
+            task_id = query.data.replace("plan_task_delete_", "")
+            user_id = query.from_user.id
+            tasks_module = context.application.bot_data.get('tasks_module')
+            if not tasks_module:
+                await query.edit_message_text("❌ Модуль задач недоступен")
+                return
+            if hasattr(tasks_module, 'delete_user_task') and tasks_module.delete_user_task(str(user_id), task_id):
+                await show_tasks_management_from_plan_callback(query, context)
+            else:
+                await query.answer("Не удалось удалить задачу", show_alert=True)
+        except Exception as e:
+            logger.error(f"Ошибка в plan_task_delete_callback: {e}", exc_info=True)
+            try:
+                if update.callback_query:
+                    await update.callback_query.answer("❌ Ошибка при удалении", show_alert=True)
+            except Exception:
+                pass
     
     async def plan_edit_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка ввода нового названия или даты при редактировании задачи из плана"""
@@ -3926,6 +3956,10 @@ def main():
     application.add_handler(CallbackQueryHandler(
         plan_task_edit_callback,
         pattern='^plan_task_edit_'
+    ))
+    application.add_handler(CallbackQueryHandler(
+        plan_task_delete_callback,
+        pattern='^plan_task_delete_'
     ))
     application.add_handler(CallbackQueryHandler(
         plan_edit_title_prompt_callback,
