@@ -912,6 +912,24 @@ def parse_deadline(deadline_str: str, deadline=None) -> Optional[datetime]:
     else:
         now_dt = current_time
     
+    # Формат "DD.MM HH:MM" (например, "02.03 18:00") — используем текущий или следующий год
+    match = re.match(r'^(\d{1,2})\.(\d{1,2})\s+(\d{1,2})[:.](\d{2})$', deadline_str)
+    if match:
+        try:
+            day = int(match.group(1))
+            month = int(match.group(2))
+            hour = int(match.group(3))
+            minute = int(match.group(4))
+            year = now_dt.year
+            if 1 <= month <= 12 and 1 <= day <= 31 and 0 <= hour <= 23 and 0 <= minute <= 59:
+                candidate = datetime(year, month, day, hour, minute, 0)
+                # Если дата/время уже прошли в этом году — переносим на следующий год
+                if candidate < now_dt:
+                    candidate = candidate.replace(year=year + 1)
+                return candidate
+        except Exception:
+            pass
+    
     # Словарь числительных прописью
     number_words = {
         'один': 1, 'одна': 1, 'одну': 1,
@@ -1344,9 +1362,9 @@ def parse_deadline(deadline_str: str, deadline=None) -> Optional[datetime]:
         'сентябрь': 9, 'октябрь': 10, 'ноябрь': 11, 'декабрь': 12
     }
     
-    # Паттерн для "15 февраля", "15 февраля 2026", "15 февраля в 14:00", "15 февраля в 14"
+    # Паттерн для "15 февраля", "15 февраля 2026", "15 февраля 14:00", "15 февраля в 14:00"
     date_month_patterns = [
-        r'^(\d{1,2})\s+(январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|июл[ья]|август[а]?|сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья])(?:\s+(\d{4}))?(?:\s+в\s+(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?)?$',
+        r'^(\d{1,2})\s+(январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|июл[ья]|август[а]?|сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья])(?:\s+(\d{4}))?(?:\s+(?:в\s+)?(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?)?$',
     ]
     
     for date_month_pattern in date_month_patterns:
