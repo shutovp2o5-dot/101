@@ -639,6 +639,21 @@ def update_user_task(user_id: str, task_id: str, updates: Dict):
     return False
 
 
+def delete_user_task(user_id: str, task_id: str) -> bool:
+    """Удаление задачи пользователя"""
+    data = load_data()
+    user_id_str = str(user_id)
+    if user_id_str not in data.get('users', {}):
+        return False
+    tasks = data['users'][user_id_str]['tasks']
+    new_tasks = [t for t in tasks if str(t.get('id')) != str(task_id)]
+    if len(new_tasks) == len(tasks):
+        return False
+    data['users'][user_id_str]['tasks'] = new_tasks
+    save_data(data)
+    return True
+
+
 def get_user_task_by_id(user_id: str, task_id: str) -> Optional[Dict]:
     """Получение задачи по ID"""
     tasks = get_user_tasks(str(user_id))
@@ -737,6 +752,8 @@ def extract_deadline_from_text(text: str) -> tuple[str, Optional[datetime]]:
         (r'\b(?:(\d{1,2})|(' + number_words_pattern + r'))(?:\s+часа?)?\s+(утра|дня|вечера|ночи)\b', 11),
         # "завтра в 14", "сегодня в 19:30", "послезавтра в 15" - в любом месте текста
         (r'\b(завтра|сегодня|послезавтра)\s+в\s+(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?\b', 10),
+        # "вторник 14:00", "понедельник в 10:30", "пт 18:00" - день недели + время
+        (r'\b(понедельник|вторник|среда|четверг|пятница|суббота|воскресенье|пн|вт|ср|чт|пт|сб|вс)\s+(?:в\s+)?(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?\b', 10),
         # "15 февраля в 14:00", "15 февраля в 14", "16 февраля 2026 в 15:30" - дата с временем
         (r'\b(\d{1,2})\s+(январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|июл[ья]|август[а]?|сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья])(?:\s+(\d{4}))?\s+в\s+(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?\b', 10),
         # "25.01.2026 18:00", "25.01.2026 в 18:00" - дата с временем
@@ -1169,7 +1186,42 @@ def parse_deadline(deadline_str: str) -> Optional[datetime]:
         days = relative_dates[deadline_str]
         return (now_dt + timedelta(days=days)).replace(hour=23, minute=59, second=59, microsecond=0)
     
-    # Дни недели
+    # День недели + время: "вторник 14:00", "понедельник в 10:30", "пт 18:00"
+    weekdays_map = {
+        'понедельник': 0, 'пн': 0,
+        'вторник': 1, 'вт': 1,
+        'среда': 2, 'ср': 2,
+        'четверг': 3, 'чт': 3,
+        'пятница': 4, 'пт': 4,
+        'суббота': 5, 'сб': 5,
+        'воскресенье': 6, 'вс': 6,
+    }
+    weekday_time_pattern = r'^(понедельник|вторник|среда|четверг|пятница|суббота|воскресенье|пн|вт|ср|чт|пт|сб|вс)\s+(?:в\s+)?(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?$'
+    match = re.match(weekday_time_pattern, deadline_str)
+    if match:
+        day_name = match.group(1).lower()
+        target_weekday = weekdays_map.get(day_name)
+        if target_weekday is not None:
+            hour = int(match.group(2))
+            minute_str = match.group(3)
+            minute = int(minute_str) if minute_str else 0
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                current_weekday = now_dt.weekday()
+                days_ahead = target_weekday - current_weekday
+                if days_ahead < 0:
+                    days_ahead += 7
+                elif days_ahead == 0:
+                    # тот же день: если время уже прошло, берём следующий раз в этот день недели
+                    candidate = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    if candidate < now_dt:
+                        days_ahead = 7
+                    else:
+                        return candidate
+                if days_ahead > 0:
+                    result = (now_dt + timedelta(days=days_ahead)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    return result
+    
+    # Дни недели (только название — конец дня 23:59)
     weekdays = {
         'понедельник': 0,
         'вторник': 1,
@@ -2158,10 +2210,8 @@ async def add_task_category_callback(update: Update, context: ContextTypes.DEFAU
     
     context.user_data['task_category'] = category
     
-    # Добавляем эмодзи к названию задачи, если его еще нет
+    # Берём итоговое название задачи без добавления служебных эмодзи
     task_title = context.user_data.get('task_title', '')
-    if task_title and not task_title.startswith('🪡'):
-        task_title = '🪡 ' + task_title
     
     # Создаем задачу
     user_id = update.effective_user.id
@@ -2652,6 +2702,7 @@ async def edit_task_select_callback(update: Update, context: ContextTypes.DEFAUL
         [InlineKeyboardButton("Дедлайн", callback_data="edit_field_deadline")],
         [InlineKeyboardButton("Напоминание", callback_data="edit_field_reminder")],
         [InlineKeyboardButton("Регулярность", callback_data="edit_field_recurrence")],
+        [InlineKeyboardButton("🗑 Удалить задачу", callback_data="edit_field_delete")],
         [InlineKeyboardButton("Отмена", callback_data="edit_cancel")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2705,7 +2756,10 @@ async def edit_field_select_callback(update: Update, context: ContextTypes.DEFAU
         await query.edit_message_text("Выберите проект (или удалите текущий):", reply_markup=reply_markup)
         return WAITING_EDIT_PROJECT
     elif field == "deadline":
-        await query.edit_message_text("Введите новый дедлайн (или /skip для удаления):")
+        await query.edit_message_text(
+            "Введите новый дедлайн (или /skip для удаления).\n\n"
+            "Например: завтра 18:00, вторник 14:00, 15.02.2026"
+        )
         return WAITING_EDIT_DEADLINE
     elif field == "reminder":
         # Показываем кнопки для напоминания
@@ -2731,6 +2785,15 @@ async def edit_field_select_callback(update: Update, context: ContextTypes.DEFAU
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text("Выберите регулярность:", reply_markup=reply_markup)
         return WAITING_EDIT_RECURRENCE
+    elif field == "delete":
+        # Удаление задачи
+        if delete_user_task(str(user_id), task_id):
+            keyboard = get_main_keyboard()
+            await query.edit_message_text("✅ Задача удалена.", reply_markup=keyboard)
+        else:
+            await query.answer("Не удалось удалить задачу", show_alert=True)
+        context.user_data.clear()
+        return ConversationHandler.END
     
     return ConversationHandler.END
 
@@ -2769,9 +2832,6 @@ async def edit_task_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_EDIT_TITLE
     
     title = capitalize_first(text)
-    # Добавляем эмодзи к названию задачи, если его еще нет
-    if title and not title.startswith('🪡') and not title.startswith('🕰'):
-        title = '🪡 ' + title
     
     update_user_task(str(user_id), task_id, {'title': title})
     
