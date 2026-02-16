@@ -2145,7 +2145,7 @@ async def finish_event_creation(query, context: ContextTypes.DEFAULT_TYPE):
     
     # Добавляем эмодзи к названию события, если его еще нет
     event_title = base_event.get('title', '')
-    if event_title and not event_title.startswith('🕰') and not event_title.startswith('🪡'):
+    if event_title and not event_title.startswith('🕰'):
         base_event['title'] = '🕰 ' + event_title
     
     # Создаём события на основе типа повторения
@@ -2962,7 +2962,7 @@ async def edit_field_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if field == 'title':
         title = update.message.text
         # Добавляем эмодзи к названию события, если его еще нет
-        if title and not title.startswith('🕰') and not title.startswith('🪡'):
+        if title and not title.startswith('🕰'):
             title = '🕰 ' + title
         event['title'] = title
     elif field == 'date':
