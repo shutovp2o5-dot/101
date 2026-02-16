@@ -522,6 +522,7 @@ def get_user_projects(user_id: str) -> List[str]:
     """Получение проектов пользователя (только активных, не завершенных)"""
     try:
         data = load_data()
+        data_changed = False
         user_data = data.get('users', {}).get(str(user_id), {})
         if not user_data:
             return []
@@ -4859,12 +4860,32 @@ def main():
                                 context.bot_data[reminder_key] = True
                                 reminders_sent += 1
                                 print(f"✅ Напоминание отправлено пользователю {user_id_str} для задачи '{task.get('title', 'Без названия')}'")
+
+                                # Обновляем время напоминания для регулярных задач
+                                recurrence = task.get('recurrence', 'once')
+                                if recurrence in ('daily', 'weekly'):
+                                    if recurrence == 'daily':
+                                        next_reminder_dt = reminder_dt + timedelta(days=1)
+                                    else:
+                                        next_reminder_dt = reminder_dt + timedelta(days=7)
+
+                                    # Сохраняем новое время напоминания в задаче
+                                    task['reminder'] = next_reminder_dt.isoformat()
+                                    data_changed = True
+
                             except Exception as e:
                                 print(f"❌ Ошибка при отправке напоминания пользователю {user_id_str}: {e}")
                 
                 except Exception as e:
                     print(f"❌ Ошибка при обработке напоминания для задачи {task.get('id')}: {e}")
         
+        # Если изменили данные (переназначили напоминания для регулярных задач) — сохраняем
+        if data_changed:
+            try:
+                save_data(data)
+            except Exception as e:
+                print(f"❌ Ошибка сохранения данных после обновления напоминаний: {e}")
+
         # Логируем статистику (только если были проверки)
         if reminders_checked > 0:
             print(f"[Напоминания] Проверено: {reminders_checked}, отправлено: {reminders_sent}, текущее время: {current_minute.strftime('%Y-%m-%d %H:%M')}")
