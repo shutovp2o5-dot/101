@@ -898,7 +898,7 @@ def extract_deadline_from_text(text: str) -> tuple[str, Optional[datetime]]:
     return text, None
 
 
-def parse_deadline(deadline_str: str) -> Optional[datetime]:
+def parse_deadline(deadline_str: str, deadline=None) -> Optional[datetime]:
     """Парсинг дедлайна из строки - поддерживает множество форматов"""
     deadline_str = deadline_str.strip().lower()
     # Нормализуем пробелы вокруг двоеточий и точек в времени
