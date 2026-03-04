@@ -1,1606 +1,4944 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Объединенный Telegram бот: Расписание + Задачи
+Telegram бот для управления проектами и задачами
+Упрощенная версия без кнопок - только команды
 """
 
-import sys
+import json
 import os
-import importlib.util
-import logging
+import re
+import io
+import tempfile
+import base64
+import aiohttp
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
-from datetime import datetime, time
-
-# Базовая директория проекта
-BASE_DIR = Path(__file__).resolve().parent
-
-# Директория для пользовательских данных (можно переопределить через DATA_DIR)
-DATA_DIR = Path(os.environ.get('DATA_DIR', BASE_DIR))
-
-# Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler('bot.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# Добавляем пути к обоим ботам (относительно текущей директории проекта)
-sys.path.insert(0, str(BASE_DIR / 'schedule-bot'))
-sys.path.insert(0, str(BASE_DIR / 'task-manager-bot'))
-
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    ConversationHandler,
     filters,
-    ConversationHandler
+    JobQueue
 )
 
-# Импортируем утилиты для оберток
-from wrappers import (
-    create_schedule_wrapper,
-    create_schedule_entry_wrapper,
-    wrap_schedule_handler,
-    create_tasks_wrapper,
-    create_tasks_entry_wrapper,
-    wrap_tasks_handler,
-    create_add_project_wrapper,
-    create_edit_project_wrapper
-)
+# Импорт для работы с часовыми поясами
+try:
+    import pytz
+    TIMEZONE_AVAILABLE = True
+except ImportError:
+    TIMEZONE_AVAILABLE = False
+    print("⚠️  pytz не установлен. Установите: pip3 install pytz")
 
-# Вспомогательная функция для завершения ConversationHandler
-async def end_conversation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Завершает ConversationHandler при нажатии на кнопки главного меню"""
-    return ConversationHandler.END
+# Определяем часовой пояс
+def get_timezone():
+    """Получает часовой пояс системы или использует московское время по умолчанию"""
+    if not TIMEZONE_AVAILABLE:
+        return None
+    
+    try:
+        # Пробуем определить локальный часовой пояс системы
+        import time
+        local_tz_name = time.tzname[0] if time.daylight == 0 else time.tzname[1]
+        
+        # Пробуем получить из переменной окружения
+        tz_env = os.environ.get('TZ')
+        if tz_env:
+            try:
+                return pytz.timezone(tz_env)
+            except:
+                pass
+        
+        # Пробуем определить по системному времени
+        try:
+            # Для macOS/Linux
+            import subprocess
+            result = subprocess.run(['date', '+%Z'], capture_output=True, text=True)
+            if result.returncode == 0:
+                tz_name = result.stdout.strip()
+                # Маппинг распространенных названий
+                tz_mapping = {
+                    'MSK': 'Europe/Moscow',
+                    'MSD': 'Europe/Moscow',
+                    'CET': 'Europe/Berlin',
+                    'CEST': 'Europe/Berlin',
+                    'UTC': 'UTC',
+                }
+                if tz_name in tz_mapping:
+                    return pytz.timezone(tz_mapping[tz_name])
+        except:
+            pass
+        
+        # По умолчанию используем московское время (для русскоязычных пользователей)
+        return pytz.timezone('Europe/Moscow')
+    except Exception as e:
+        print(f"Ошибка определения часового пояса: {e}")
+        # По умолчанию московское время
+        return pytz.timezone('Europe/Moscow') if TIMEZONE_AVAILABLE else None
 
-# Режимы работы бота
-MODE_MAIN = "main"
-MODE_SCHEDULE = "schedule"
-MODE_TASKS = "tasks"
-MODE_PLAN = "plan"
+# Получаем часовой пояс
+TZ = get_timezone()
 
-# Состояния для единого сценария добавления дела (событие/задача)
-(WAITING_UNIFIED_TITLE,
- WAITING_UNIFIED_DEADLINE,
- WAITING_UNIFIED_COMMENT,
- WAITING_UNIFIED_PROJECT,
- WAITING_UNIFIED_RECURRENCE,
- WAITING_UNIFIED_REMINDER,
- WAITING_UNIFIED_TYPE) = range(100, 107)
+def now():
+    """Возвращает текущее время с учетом часового пояса"""
+    if TZ:
+        return datetime.now(TZ)
+    else:
+        return datetime.now()
 
-def get_unified_main_keyboard():
-    """Главное меню объединенного бота"""
+# Опциональные импорты для голосовых сообщений
+VOICE_SUPPORT = False
+recognizer = None
+
+try:
+    import speech_recognition as sr
+    from pydub import AudioSegment
+    VOICE_SUPPORT = True
+    recognizer = sr.Recognizer()
+    print("✅ SpeechRecognition и pydub установлены - голосовые сообщения работают!")
+except ImportError:
+    VOICE_SUPPORT = False
+    print("⚠️  SpeechRecognition и pydub не установлены")
+    print("   Для работы голосовых сообщений выполните:")
+    print("   pip3 install SpeechRecognition pydub")
+    print("   brew install ffmpeg")
+
+# Базовая директория для данных (можно переопределить через переменную окружения TASKS_DATA_DIR)
+DATA_DIR = os.environ.get('TASKS_DATA_DIR')
+if DATA_DIR:
+    DATA_DIR = Path(DATA_DIR)
+else:
+    # По умолчанию используем директорию, где лежит этот файл
+    DATA_DIR = Path(__file__).resolve().parent
+
+
+# Состояния для ConversationHandler
+(WAITING_TASK_TITLE, WAITING_TASK_COMMENT, WAITING_TASK_PROJECT, WAITING_TASK_DEADLINE, WAITING_TASK_REMINDER, WAITING_TASK_RECURRENCE, WAITING_TASK_CATEGORY) = range(7)
+(WAITING_PROJECT_NAME, WAITING_PROJECT_TYPE, WAITING_PROJECT_TARGET_TASKS, WAITING_PROJECT_PRIORITY, WAITING_PROJECT_END_DATE, WAITING_PROJECT_CATEGORY) = range(7, 13)
+(WAITING_TASK_COMPLETE_CONFIRM, WAITING_TASK_RESCHEDULE) = range(13, 15)
+(WAITING_EDIT_TASK_SELECT, WAITING_EDIT_FIELD_SELECT, WAITING_EDIT_TITLE, WAITING_EDIT_COMMENT, WAITING_EDIT_PROJECT, WAITING_EDIT_DEADLINE, WAITING_EDIT_REMINDER, WAITING_EDIT_RECURRENCE) = range(15, 23)
+(WAITING_EDIT_PROJECT_TARGET_TASKS, WAITING_PROJECT_COMPLETE_CONFIRM, WAITING_EDIT_PROJECT_NAME) = range(23, 26)
+
+# Файл для хранения данных
+DATA_FILE = str(DATA_DIR / 'tasks_data.json')
+BACKUP_FILE = f"{DATA_FILE}.bak"
+
+
+def atomic_write_with_backup(file_path: str, data: Dict) -> None:
+    """Безопасная запись JSON с созданием .bak-резерва перед перезаписью"""
+    from pathlib import Path as _Path
+    import shutil as _shutil
+    tmp_path = f"{file_path}.tmp"
+    backup_path = f"{file_path}.bak"
+
+    path = _Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Делаем резервную копию текущего файла (если есть)
+    if path.exists():
+        try:
+            _shutil.copy2(path, backup_path)
+        except Exception:
+            # Если бэкап не удался, не мешаем основному сохранению
+            pass
+
+    # Пишем во временный файл и атомарно заменяем основной
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, file_path)
+
+
+def capitalize_first(text: str) -> str:
+    """Редактура: делает первую букву заглавной"""
+    if not text:
+        return text
+    return text[0].upper() + text[1:] if len(text) > 1 else text.upper()
+
+
+def normalize_voice_text(text: str) -> str:
+    """Нормализует текст после распознавания голоса для лучшего парсинга дедлайнов"""
+    if not text:
+        return text
+    
+    # Сохраняем оригинал для логирования
+    original = text
+    
+    # Приводим к нижнему регистру для обработки
+    normalized = text.lower().strip()
+    
+    # Словарь замен для исправления частых ошибок распознавания
+    replacements = [
+        # Относительные даты - исправление вариантов написания
+        (r'\bзавтрашний день\b', 'завтра'),
+        (r'\bзавтрашний\b', 'завтра'),
+        (r'\bпосле завтра\b', 'послезавтра'),
+        (r'\bпосле завтрашний\b', 'послезавтра'),
+        (r'\bпослезавтрашний\b', 'послезавтра'),
+        (r'\bпосле завтрашнего дня\b', 'послезавтра'),
+        (r'\bсегодняшний день\b', 'сегодня'),
+        (r'\bсегодняшний\b', 'сегодня'),
+        
+        # Время суток - исправление падежей
+        (r'\bутром\b', 'утра'),
+        (r'\bднем\b', 'дня'),
+        (r'\bднём\b', 'дня'),
+        (r'\bвечером\b', 'вечера'),
+        (r'\bночью\b', 'ночи'),
+        
+        # Время - исправление форматов "16 часов 30" -> "16:30"
+        (r'\b(\d{1,2})\s*часов\s*(\d{1,2})\s*(?:минут?|м)?\b', r'\1:\2'),
+        (r'\b(\d{1,2})\s*час\s*(\d{1,2})\s*(?:минут?|м)?\b', r'\1:\2'),
+        (r'\b(\d{1,2})\s*ч\s*(\d{1,2})\s*(?:минут?|м)?\b', r'\1:\2'),
+        (r'\b(\d{1,2})\s*часа\s*(\d{1,2})\s*(?:минут?|м)?\b', r'\1:\2'),
+        # "16 часов" -> "16:00"
+        (r'\b(\d{1,2})\s+часов\b', r'\1:00'),
+        (r'\b(\d{1,2})\s+час\b', r'\1:00'),
+        (r'\b(\d{1,2})\s+ч\b', r'\1:00'),
+        
+        # Убираем лишние слова перед временем
+        (r'\bвремя\s+(\d{1,2}[:.]?\d{0,2})\b', r'\1'),
+        (r'\bв\s+(\d{1,2}[:.]?\d{0,2})\s+часов\b', r'в \1'),
+        (r'\bв\s+(\d{1,2}[:.]?\d{0,2})\s+час\b', r'в \1'),
+        (r'\bв\s+(\d{1,2}[:.]?\d{0,2})\s+часа\b', r'в \1'),
+        
+        # Нормализация пробелов вокруг двоеточий и точек
+        (r'\s*:\s*', ':'),
+        (r'\s*\.\s*', '.'),
+        
+        # Исправление времени без разделителя: "16 00" -> "16:00" (только если это похоже на время)
+        (r'\bв\s+(\d{1,2})\s+(\d{2})\b', r'в \1:\2'),  # "в 16 00" -> "в 16:00"
+        (r'\b(\d{1,2})\s+(\d{2})\s+(часов?|ч|минут?|м|утра|дня|вечера|ночи|завтра|сегодня|послезавтра)', r'\1:\2 \3'),
+        (r'\b(\d{1,2})\s+(\d{2})\s*$', r'\1:\2'),  # В конце строки "16 00" -> "16:00"
+        # "16 30" после даты -> "16:30"
+        (r'\b(завтра|сегодня|послезавтра|\d{1,2}\s+(?:январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|июл[ья]|август[а]?|сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья]))\s+(\d{1,2})\s+(\d{2})\b', r'\1 в \2:\3'),
+        # "16 30" в любом месте -> "16:30" (если похоже на время)
+        (r'\b(\d{1,2})\s+(\d{2})\b(?!\s*(?:январ|феврал|март|апрел|май|июн|июл|август|сентябр|октябр|ноябр|декабр|дня|недел|месяц))', r'\1:\2'),
+        
+        # Исправление порядка: время перед датой -> дата перед временем
+        (r'\bв\s+(\d{1,2}[:.]?\d{0,2})\s+(завтра|сегодня|послезавтра)\b', r'\2 в \1'),
+        (r'\b(\d{1,2}[:.]\d{2})\s+(завтра|сегодня|послезавтра)\b', r'\2 в \1'),
+        (r'\b(\d{1,2})\s+(завтра|сегодня|послезавтра)\b', r'\2 в \1'),
+        
+        # Исправление "в" перед временем суток
+        (r'\bв\s+(\d{1,2})\s+(утра|дня|вечера|ночи)\b', r'\1 \2'),
+        (r'\bв\s+(\d{1,2})\s+часа?\s+(утра|дня|вечера|ночи)\b', r'\1 \2'),
+        
+        # Исправление написания чисел прописью (если распознано неправильно)
+        (r'\bодиннадцать\b', 'одиннадцать'),
+        (r'\bдвенадцать\b', 'двенадцать'),
+        (r'\bтринадцать\b', 'тринадцать'),
+        (r'\bчетырнадцать\b', 'четырнадцать'),
+        (r'\bпятнадцать\b', 'пятнадцать'),
+        (r'\bшестнадцать\b', 'шестнадцать'),
+        (r'\bсемнадцать\b', 'семнадцать'),
+        (r'\bвосемнадцать\b', 'восемнадцать'),
+        (r'\bдевятнадцать\b', 'девятнадцать'),
+        (r'\bдвадцать\b', 'двадцать'),
+        
+        # Исправление "через" - убираем лишние пробелы
+        (r'\bчерез\s+(\d+)\s+(дня|дней|день)\b', r'через \1 дня'),
+        (r'\bчерез\s+(\d+)\s+(неделю|недели|недель)\b', r'через \1 недели'),
+        
+        # Исправление дат - убираем "-го", "-е" и т.д.
+        (r'\b(\d{1,2})[-гое]\s+(январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|июл[ья]|август[а]?|сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья])', r'\1 \2'),
+        (r'\b(\d{1,2})\s+[-гое]\s+(январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|июл[ья]|август[а]?|сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья])', r'\1 \2'),
+        
+        # Убираем лишние знаки препинания, которые могут мешать
+        (r'[,;]\s*', ' '),
+    ]
+    
+    # Применяем замены последовательно
+    try:
+        for pattern, replacement in replacements:
+            try:
+                normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+            except re.error as e:
+                print(f"⚠️ Ошибка в регулярном выражении '{pattern}': {e}")
+                # Пропускаем проблемное выражение и продолжаем
+                continue
+    except Exception as e:
+        print(f"❌ Критическая ошибка при нормализации текста: {e}")
+        import traceback
+        traceback.print_exc()
+        # Возвращаем оригинальный текст, если нормализация не удалась
+        return capitalize_first(original)
+    
+    # Нормализуем множественные пробелы
+    normalized = re.sub(r'\s+', ' ', normalized)
+    
+    # Убираем пробелы в начале и конце
+    normalized = normalized.strip()
+    
+    # Восстанавливаем первую заглавную букву
+    normalized = capitalize_first(normalized)
+    
+    if original != normalized:
+        print(f"Нормализованный текст после распознавания голоса: '{original}' -> '{normalized}'")
+    return normalized
+
+
+def format_date_readable(date_dt: datetime) -> str:
+    """Форматирует дату в читаемый формат: сегодня/завтра/10 февраля"""
+    current_time = now()
+    if current_time.tzinfo:
+        current_time = current_time.replace(tzinfo=None)
+    if date_dt.tzinfo:
+        date_dt = date_dt.replace(tzinfo=None)
+    
+    now_dt = current_time
+    today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    date_start = date_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    months = {
+        1: 'января', 2: 'февраля', 3: 'марта', 4: 'апреля',
+        5: 'мая', 6: 'июня', 7: 'июля', 8: 'августа',
+        9: 'сентября', 10: 'октября', 11: 'ноября', 12: 'декабря'
+    }
+    
+    days_diff = (date_start - today_start).days
+    
+    if days_diff == 0:
+        return "сегодня"
+    elif days_diff == 1:
+        return "завтра"
+    elif days_diff == 2:
+        return "послезавтра"
+    else:
+        day = date_dt.day
+        month = months[date_dt.month]
+        return f"{day} {month}"
+
+
+def format_date_full(date_dt: datetime) -> str:
+    """Форматирует дату в полном формате: сегодня, 8 февраля, вскр"""
+    current_time = now()
+    if current_time.tzinfo:
+        current_time = current_time.replace(tzinfo=None)
+    if date_dt.tzinfo:
+        date_dt = date_dt.replace(tzinfo=None)
+    
+    now_dt = current_time
+    today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    date_start = date_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    months = {
+        1: 'января', 2: 'февраля', 3: 'марта', 4: 'апреля',
+        5: 'мая', 6: 'июня', 7: 'июля', 8: 'августа',
+        9: 'сентября', 10: 'октября', 11: 'ноября', 12: 'декабря'
+    }
+    
+    weekdays_short = {
+        0: 'Пн', 1: 'Вт', 2: 'Ср', 3: 'Чт', 4: 'Пт', 5: 'Сб', 6: 'Вс'
+    }
+    
+    days_diff = (date_start - today_start).days
+    
+    # Относительная дата
+    if days_diff == 0:
+        relative_date = "сегодня"
+    elif days_diff == 1:
+        relative_date = "завтра"
+    elif days_diff == 2:
+        relative_date = "послезавтра"
+    else:
+        relative_date = None
+    
+    # Полная дата
+    day = date_dt.day
+    month = months[date_dt.month]
+    full_date = f"{day} {month}"
+    
+    # День недели
+    weekday = weekdays_short[date_dt.weekday()]
+    
+    # Формируем результат
+    if relative_date:
+        return f"{relative_date}, {full_date}, {weekday}"
+    else:
+        return f"{full_date}, {weekday}"
+
+
+def format_deadline_readable(deadline_dt: datetime) -> str:
+    """Форматирует дедлайн в читаемый формат: завтра/10 февраля/12 февраля + время"""
+    # Получаем текущее время с учетом часового пояса
+    current_time = now()
+    
+    # Приводим к naive datetime для сравнения (если есть часовой пояс, убираем его)
+    if current_time.tzinfo:
+        current_time = current_time.replace(tzinfo=None)
+    if deadline_dt.tzinfo:
+        deadline_dt = deadline_dt.replace(tzinfo=None)
+    
+    now_dt = current_time
+    today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    deadline_start = deadline_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # Названия месяцев
+    months = {
+        1: 'января', 2: 'февраля', 3: 'марта', 4: 'апреля',
+        5: 'мая', 6: 'июня', 7: 'июля', 8: 'августа',
+        9: 'сентября', 10: 'октября', 11: 'ноября', 12: 'декабря'
+    }
+    
+    # Вычисляем разницу в днях
+    days_diff = (deadline_start - today_start).days
+    
+    # Форматируем время
+    time_str = deadline_dt.strftime('%H:%M')
+    
+    # Определяем формат даты
+    if days_diff == 0:
+        date_str = "сегодня"
+    elif days_diff == 1:
+        date_str = "завтра"
+    elif days_diff == 2:
+        date_str = "послезавтра"
+    else:
+        # Формат: "10 февраля"
+        day = deadline_dt.day
+        month = months[deadline_dt.month]
+        date_str = f"{day} {month}"
+    
+    # Если время не 23:59 (конец дня), добавляем его
+    if deadline_dt.hour == 23 and deadline_dt.minute == 59:
+        return date_str
+    else:
+        return f"{date_str} {time_str}"
+
+
+async def transcribe_voice(voice_file, update: Update = None) -> Optional[str]:
+    """Транскрибация голосового сообщения в текст"""
+    # Сначала пробуем использовать caption от Telegram (если есть)
+    if update and update.message.voice:
+        if update.message.caption:
+            print(f"✅ Использован caption от Telegram: {update.message.caption}")
+            # Нормализуем caption для лучшего парсинга дедлайнов
+            return normalize_voice_text(update.message.caption)
+    
+    # Проверяем доступность библиотек
+    if not VOICE_SUPPORT:
+        print("❌ VOICE_SUPPORT = False")
+        return None
+    
+    if recognizer is None:
+        print("❌ recognizer is None")
+        return None
+    
+    print("✅ Библиотеки для распознавания доступны")
+    
+    temp_ogg = None
+    temp_wav = None
+    try:
+        # Скачиваем файл
+        print("Скачивание голосового файла...")
+        file_content = await voice_file.download_as_bytearray()
+        
+        if not file_content or len(file_content) == 0:
+            print("Ошибка: файл пустой")
+            return None
+        
+        print(f"Файл скачан, размер: {len(file_content)} байт")
+        
+        # Создаем временные файлы
+        temp_ogg = tempfile.NamedTemporaryFile(delete=False, suffix='.ogg').name
+        with open(temp_ogg, 'wb') as f:
+            f.write(file_content)
+        
+        print("Конвертация OGG в WAV...")
+        # Конвертируем OGG в WAV с оптимизированными параметрами
+        try:
+            # Используем более быстрый метод конвертации
+            # Пробуем сначала from_ogg, если не получается - from_file
+            try:
+                audio = AudioSegment.from_ogg(temp_ogg)
+            except:
+                print("Попытка конвертации через from_file...")
+                audio = AudioSegment.from_file(temp_ogg, format="ogg")
+            
+            # Оптимизируем аудио для быстрого распознавания
+            # Моно, 16kHz - оптимально для распознавания речи
+            print("Оптимизация аудио (моно, 16kHz)...")
+            audio = audio.set_channels(1).set_frame_rate(16000)
+            
+            temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix='.wav').name
+            # Используем быстрый экспорт с параметрами для ffmpeg
+            print("Экспорт в WAV...")
+            try:
+                audio.export(temp_wav, format="wav", parameters=["-ac", "1", "-ar", "16000"])
+            except:
+                # Если не получилось с параметрами, пробуем без них
+                print("Экспорт без дополнительных параметров...")
+                audio.export(temp_wav, format="wav")
+            print("✅ Конвертация завершена")
+        except Exception as e:
+            print(f"❌ Ошибка конвертации аудио: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        
+        # Используем распознаватель речи
+        print("Распознавание речи...")
+        try:
+            with sr.AudioFile(temp_wav) as source:
+                # Читаем весь файл без дополнительной обработки
+                audio_data = recognizer.record(source)
+            
+            # Распознаем речь с таймаутом
+            print("Отправка запроса к Google Speech API...")
+            try:
+                # Используем show_all=False для более быстрого ответа
+                text = recognizer.recognize_google(audio_data, language='ru-RU', show_all=False)
+                print(f"Распознано через SpeechRecognition: {text}")
+                # Нормализуем текст для лучшего парсинга дедлайнов
+                normalized_text = normalize_voice_text(text)
+                return normalized_text
+            except sr.UnknownValueError:
+                print("Не удалось распознать речь - Google не смог распознать аудио")
+                return None
+            except sr.RequestError as e:
+                print(f"Ошибка запроса к сервису распознавания: {e}")
+                print("Возможные причины: проблемы с интернетом или недоступность Google Speech API")
+                return None
+        except Exception as e:
+            print(f"Ошибка при чтении аудио файла: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+            
+    except Exception as e:
+        print(f"Общая ошибка обработки голосового сообщения: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+    finally:
+        # Удаляем временные файлы
+        try:
+            if temp_ogg and os.path.exists(temp_ogg):
+                os.unlink(temp_ogg)
+                print(f"Удален временный файл: {temp_ogg}")
+            if temp_wav and os.path.exists(temp_wav):
+                os.unlink(temp_wav)
+                print(f"Удален временный файл: {temp_wav}")
+        except Exception as e:
+            print(f"Ошибка удаления временных файлов: {e}")
+
+
+def load_data() -> Dict:
+    """Загрузка данных из файла"""
+    if not os.path.exists(DATA_FILE):
+        return {'users': {}, 'projects': {}}
+
+    try:
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        # Пытаемся восстановить из .bak, если основной файл повреждён
+        if os.path.exists(BACKUP_FILE):
+            try:
+                with open(BACKUP_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {'users': {}, 'projects': {}}
+    except Exception:
+        return {'users': {}, 'projects': {}}
+
+
+def save_data(data: Dict):
+    """Сохранение данных в файл"""
+    atomic_write_with_backup(DATA_FILE, data)
+
+
+def get_user_tasks(user_id: str) -> List[Dict]:
+    """Получение задач пользователя"""
+    data = load_data()
+    tasks = data.get('users', {}).get(str(user_id), {}).get('tasks', [])
+    
+    # Помечаем просроченные задачи (только в оперативных данных, без немедленной записи)
+    now_dt = now()
+    if now_dt.tzinfo:
+        now_dt = now_dt.replace(tzinfo=None)
+    
+    for task in tasks:
+        if task.get('completed'):
+            continue
+        deadline_str = task.get('deadline')
+        if not deadline_str:
+            continue
+        try:
+            from datetime import datetime as _dt
+            deadline_dt = _dt.fromisoformat(deadline_str)
+            if deadline_dt.tzinfo:
+                deadline_dt = deadline_dt.replace(tzinfo=None)
+            task['overdue'] = deadline_dt < now_dt
+        except Exception:
+            # Если дедлайн некорректный, не помечаем задачу
+            continue
+
+    # Сортируем задачи по времени исполнения (дедлайн), без дедлайна — в конце
+    from datetime import datetime as _dt
+
+    def _task_sort_key(t: Dict):
+        deadline_str = t.get('deadline')
+        if deadline_str:
+            try:
+                dt = _dt.fromisoformat(deadline_str)
+                if dt.tzinfo:
+                    dt = dt.replace(tzinfo=None)
+            except Exception:
+                dt = _dt.max
+        else:
+            dt = _dt.max
+
+        created_str = t.get('created_at')
+        if created_str:
+            try:
+                created = _dt.fromisoformat(created_str)
+            except Exception:
+                created = _dt.max
+        else:
+            created = _dt.max
+
+        return (dt, created)
+
+    tasks.sort(key=_task_sort_key)
+    return tasks
+
+
+def get_user_projects(user_id: str) -> List[str]:
+    """Получение проектов пользователя (только активных, не завершенных)"""
+    try:
+        data = load_data()
+        data_changed = False
+        user_data = data.get('users', {}).get(str(user_id), {})
+        if not user_data:
+            return []
+        
+        projects_data = user_data.get('projects_data', {})
+        if not projects_data:
+            return []
+        
+        active_projects = []
+        for project_name, project_data in projects_data.items():
+            if isinstance(project_data, dict):
+                if not project_data.get('completed', False):
+                    active_projects.append(project_name)
+            else:
+                # Если project_data не словарь, все равно добавляем проект
+                active_projects.append(project_name)
+        return active_projects
+    except Exception as e:
+        print(f"Ошибка в get_user_projects для user_id {user_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+def update_user_project(user_id: str, project_name: str, updates: Dict):
+    """Обновление проекта пользователя"""
+    data = load_data()
+    user_id_str = str(user_id)
+    
+    if 'users' not in data or user_id_str not in data['users']:
+        return False
+    
+    projects_data = data['users'][user_id_str].get('projects_data', {})
+    if project_name in projects_data:
+        projects_data[project_name].update(updates)
+        save_data(data)
+        return True
+    return False
+
+
+def rename_user_project(user_id: str, old_name: str, new_name: str):
+    """Переименование проекта пользователя"""
+    data = load_data()
+    user_id_str = str(user_id)
+    
+    if 'users' not in data or user_id_str not in data['users']:
+        return False
+    
+    projects_data = data['users'][user_id_str].get('projects_data', {})
+    if old_name not in projects_data:
+        return False
+    
+    # Проверяем, что новое имя не занято
+    if new_name in projects_data:
+        return False
+    
+    # Сохраняем данные проекта
+    project_data = projects_data[old_name]
+    
+    # Удаляем старое имя и добавляем новое
+    del projects_data[old_name]
+    projects_data[new_name] = project_data
+    
+    # Обновляем все задачи, которые ссылаются на этот проект
+    tasks = data['users'][user_id_str].get('tasks', [])
+    for task in tasks:
+        if task.get('project') == old_name:
+            task['project'] = new_name
+    
+    # Обновляем список projects, если он используется
+    projects_list = data['users'][user_id_str].get('projects', [])
+    if old_name in projects_list:
+        projects_list.remove(old_name)
+        if new_name not in projects_list:
+            projects_list.append(new_name)
+    
+    save_data(data)
+    return True
+
+
+def save_user_task(user_id: str, task: Dict):
+    """Сохранение задачи пользователя"""
+    data = load_data()
+    user_id_str = str(user_id)
+    
+    if 'users' not in data:
+        data['users'] = {}
+    if user_id_str not in data['users']:
+        data['users'][user_id_str] = {'tasks': [], 'projects': [], 'tags': [], 'projects_data': {}}
+    
+    data['users'][user_id_str]['tasks'].append(task)
+    save_data(data)
+
+
+def update_user_task(user_id: str, task_id: str, updates: Dict):
+    """Обновление задачи пользователя"""
+    data = load_data()
+    user_id_str = str(user_id)
+    
+    if 'users' not in data or user_id_str not in data['users']:
+        return False
+    
+    tasks = data['users'][user_id_str]['tasks']
+    for i, task in enumerate(tasks):
+        if task.get('id') == task_id:
+            # Сохраняем источник из оригинальной задачи, если он не указан в обновлении
+            if 'source' not in updates and 'source' in task:
+                updates['source'] = task['source']
+            # Если источника нет ни в оригинале, ни в обновлении, устанавливаем по умолчанию
+            if 'source' not in updates:
+                updates['source'] = 'tasks'
+            tasks[i].update(updates)
+            save_data(data)
+            return True
+    return False
+
+
+def delete_user_task(user_id: str, task_id: str) -> bool:
+    """Удаление задачи пользователя"""
+    data = load_data()
+    user_id_str = str(user_id)
+    if user_id_str not in data.get('users', {}):
+        return False
+    tasks = data['users'][user_id_str]['tasks']
+    new_tasks = [t for t in tasks if str(t.get('id')) != str(task_id)]
+    if len(new_tasks) == len(tasks):
+        return False
+    data['users'][user_id_str]['tasks'] = new_tasks
+    save_data(data)
+    return True
+
+
+def get_user_task_by_id(user_id: str, task_id: str) -> Optional[Dict]:
+    """Получение задачи по ID"""
+    tasks = get_user_tasks(str(user_id))
+    for task in tasks:
+        if task.get('id') == task_id:
+            return task
+    return None
+
+
+def add_user_project(user_id: str, project_name: str, category: str = None, project_type: str = None, target_tasks: int = None, priority: int = None, end_date: str = None):
+    """Добавление проекта пользователя
+    
+    Args:
+        user_id: ID пользователя
+        project_name: Название проекта
+        category: Категория проекта (опционально)
+        project_type: Тип проекта ('software' или 'project')
+        target_tasks: Количество запланированных задач (для проектных проектов)
+        priority: Приоритет проекта (1, 2, 3) - только для проектных проектов
+        end_date: Дата окончания проекта в формате YYYY-MM-DD (опционально)
+    """
+    data = load_data()
+    user_id_str = str(user_id)
+    
+    if 'users' not in data:
+        data['users'] = {}
+    if user_id_str not in data['users']:
+        data['users'][user_id_str] = {'tasks': [], 'projects': [], 'tags': [], 'projects_data': {}}
+    
+    if 'projects_data' not in data['users'][user_id_str]:
+        data['users'][user_id_str]['projects_data'] = {}
+    
+    if project_name not in data['users'][user_id_str]['projects_data']:
+        project_data = {}
+        if category:
+            project_data['category'] = category
+        if project_type:
+            project_data['type'] = project_type
+        if target_tasks is not None:
+            project_data['target_tasks'] = target_tasks
+        if priority is not None:
+            project_data['priority'] = priority
+        if end_date:
+            project_data['end_date'] = end_date
+        data['users'][user_id_str]['projects_data'][project_name] = project_data
+        save_data(data)
+        return True
+    return False
+
+
+def get_user_project_categories(user_id: str) -> List[str]:
+    """Получение категорий проектов пользователя"""
+    data = load_data()
+    projects_data = data.get('users', {}).get(str(user_id), {}).get('projects_data', {})
+    categories = set()
+    for project_data in projects_data.values():
+        if 'category' in project_data:
+            categories.add(project_data['category'])
+    return sorted(list(categories))
+
+
+def get_main_keyboard():
+    """Главное меню с кнопками"""
     keyboard = [
-        [KeyboardButton("➕")],
-        [KeyboardButton("Проекты"), KeyboardButton("Статистика")],
-        [KeyboardButton("📋 План")]
+        [KeyboardButton("Добавить задачу"), KeyboardButton("Список задач")],
+        [KeyboardButton("Статистика"), KeyboardButton("Проекты")],
+        [KeyboardButton("Редактировать")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-async def unified_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start для объединенного бота"""
-    try:
-        if not update.message:
-            logger.warning("unified_start вызван без сообщения")
-            return
-        
-        context.user_data['bot_mode'] = MODE_MAIN
-        keyboard = get_unified_main_keyboard()
-        await update.message.reply_text(
-            "👋 <b>Добро пожаловать в объединенный бот!</b>\n\n"
-            "Нажмите ➕, чтобы добавить новое дело.\n"
-            "В конце вы выберете, это 📅 событие или ✅ задача.",
-            parse_mode='HTML',
-            reply_markup=keyboard
-        )
-        logger.info(f"Команда /start обработана для пользователя {update.effective_user.id}")
-    except Exception as e:
-        logger.error(f"Ошибка в unified_start: {e}", exc_info=True)
-        try:
-            if update.message:
-                await update.message.reply_text("❌ Ошибка при обработке команды /start")
-        except Exception as send_error:
-            logger.error(f"Не удалось отправить сообщение об ошибке: {send_error}")
 
-def get_schedule_keyboard():
-    """Клавиатура раздела расписания"""
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("➕"), KeyboardButton("✏️")],
-        [KeyboardButton("🏠 Главное меню")]
-    ], resize_keyboard=True)
-
-async def switch_to_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Переключение в режим расписания"""
-    try:
-        if not update.message:
-            logger.warning("switch_to_schedule вызван без сообщения")
-            return
-        
-        context.user_data['bot_mode'] = MODE_SCHEDULE
-        
-        await update.message.reply_text(
-            "📅 <b>Режим: Расписание</b>\n\n"
-            "Выберите действие:",
-            parse_mode='HTML',
-            reply_markup=get_schedule_keyboard()
-        )
-        logger.debug(f"Пользователь {update.effective_user.id} переключился в режим расписания")
-    except Exception as e:
-        logger.error(f"Ошибка при переключении в режим расписания: {e}", exc_info=True)
-        try:
-            if update.message:
-                await update.message.reply_text("❌ Ошибка при переключении режима")
-        except Exception:
-            pass
-
-def get_plan_keyboard():
-    """Компактная клавиатура раздела плана"""
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("📅 План на сегодня"), KeyboardButton("📅 План на завтра")],
-        [KeyboardButton("📅 План на неделю"), KeyboardButton("📅 План на месяц")],
-        [KeyboardButton("📅 План на год"), KeyboardButton("📅 План на 3 года")],
-        [KeyboardButton("✅ Управление задачами"), KeyboardButton("✏️ Редактировать события")],
-        [KeyboardButton("🏠 Главное меню")]
-    ], resize_keyboard=True)
-
-def get_tasks_keyboard():
-    """Клавиатура раздела задач"""
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("➕"), KeyboardButton("✏️")],
-        [KeyboardButton("🏠 Главное меню")]
-    ], resize_keyboard=True)
-
-async def switch_to_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Переключение в режим задач"""
-    try:
-        if not update.message:
-            logger.warning("switch_to_tasks вызван без сообщения")
-            return
-        
-        context.user_data['bot_mode'] = MODE_TASKS
-        
-        await update.message.reply_text(
-            "✅ <b>Режим: Задачи</b>\n\n"
-            "Выберите действие:",
-            parse_mode='HTML',
-            reply_markup=get_tasks_keyboard()
-        )
-        logger.debug(f"Пользователь {update.effective_user.id} переключился в режим задач")
-    except Exception as e:
-        logger.error(f"Ошибка при переключении в режим задач: {e}", exc_info=True)
-        try:
-            if update.message:
-                await update.message.reply_text("❌ Ошибка при переключении режима")
-        except Exception:
-            pass
-
-async def switch_to_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Переключение в режим плана - показывает объединенный план из задач и расписания"""
-    try:
-        if not update.message:
-            logger.warning("switch_to_plan вызван без сообщения")
-            return
-        
-        context.user_data['bot_mode'] = MODE_PLAN
-        
-        # Сразу показываем план на сегодня при входе в раздел
-        user_id = update.effective_user.id
-        schedule_module = context.application.bot_data.get('schedule_module')
-        tasks_module = context.application.bot_data.get('tasks_module')
-        
-        events, tasks = get_combined_plan(user_id, schedule_module, tasks_module, days=1)
-        text = format_combined_plan_text(events, tasks, "сегодня")
-        
-        await update.message.reply_text(
-            text,
-            parse_mode='HTML',
-            reply_markup=get_plan_keyboard()
-        )
-        logger.debug(f"Пользователь {user_id} переключился в режим плана")
-    except Exception as e:
-        logger.error(f"Ошибка при переключении в режим плана: {e}", exc_info=True)
-        try:
-            if update.message:
-                await update.message.reply_text(
-                    "❌ Ошибка при загрузке плана. Попробуйте позже.",
-                    reply_markup=get_plan_keyboard()
-                )
-        except Exception:
-            pass
-
-async def show_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать проекты с возможностью управления (добавление, редактирование)"""
-    try:
-        if not update.message:
-            logger.warning("show_projects вызван без сообщения")
-            return
-        
-        tasks_module = context.application.bot_data.get('tasks_module')
-        
-        if tasks_module and hasattr(tasks_module, 'projects_list'):
-            # Используем функционал управления проектами из task-manager-bot
-            # Временно устанавливаем режим задач для корректной работы функции
-            old_mode = context.user_data.get('bot_mode', MODE_MAIN)
-            context.user_data['bot_mode'] = MODE_TASKS
-            try:
-                await tasks_module.projects_list(update, context)
-            except Exception as e:
-                logger.error(f"Ошибка при показе проектов: {e}", exc_info=True)
-                await update.message.reply_text(
-                    "❌ Ошибка при загрузке проектов",
-                    reply_markup=get_unified_main_keyboard()
-                )
-            finally:
-                # Возвращаем режим обратно
-                context.user_data['bot_mode'] = old_mode
-        else:
-            # Fallback: показываем простой список проектов
-            await update.message.reply_text(
-                "❌ Функционал управления проектами недоступен",
-                reply_markup=get_unified_main_keyboard()
-            )
-    except Exception as e:
-        logger.error(f"Ошибка в show_projects: {e}", exc_info=True)
-        try:
-            if update.message:
-                await update.message.reply_text(
-                    "❌ Ошибка при обработке запроса",
-                    reply_markup=get_unified_main_keyboard()
-                )
-        except Exception:
-            pass
-
-async def back_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Возврат в главное меню"""
-    try:
-        if not update.message:
-            logger.warning("back_to_main_menu вызван без сообщения")
-            return
-        
-        context.user_data['bot_mode'] = MODE_MAIN
-        keyboard = get_unified_main_keyboard()
-        await update.message.reply_text(
-            "🏠 <b>Главное меню</b>\n\n"
-            "Нажмите ➕, чтобы добавить новое дело.\n"
-            "В конце вы выберете, это 📅 событие или ✅ задача.",
-            parse_mode='HTML',
-            reply_markup=keyboard
-        )
-    except Exception as e:
-        logger.error(f"Ошибка при возврате в главное меню: {e}", exc_info=True)
-        try:
-            if update.message:
-                await update.message.reply_text("❌ Ошибка при возврате в меню")
-        except Exception:
-            pass
-
-
-async def unified_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Старт единого сценария добавления дела (событие или задача) по кнопке ➕"""
-    try:
-        if not update.message:
-            logger.warning("unified_add_start вызван без сообщения")
-            return
-        
-        # Очищаем временные данные
-        context.user_data.pop('unified_item', None)
-        
-        context.user_data['unified_item'] = {}
-        await update.message.reply_text("Как назовём?")
-        return WAITING_UNIFIED_TITLE
-    except Exception as e:
-        logger.error(f"Ошибка в unified_add_start: {e}", exc_info=True)
-        if update.message:
-            await update.message.reply_text("❌ Ошибка при запуске добавления дела")
-        return ConversationHandler.END
-
-
-async def unified_add_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение названия и попытка вытащить дедлайн из текста (через модуль задач)"""
-    try:
-        if not update.message or not update.message.text:
-            await update.message.reply_text("Название не может быть пустым. Попробуйте ещё раз:")
-            return WAITING_UNIFIED_TITLE
-        
-        raw_text = update.message.text.strip()
-        if not raw_text:
-            await update.message.reply_text("Название не может быть пустым. Попробуйте ещё раз:")
-            return WAITING_UNIFIED_TITLE
-        
-        tasks_module = context.application.bot_data.get('tasks_module')
-        
-        title = raw_text
-        deadline_iso = None
-        
-        # Пробуем использовать логику извлечения дедлайна из модуля задач
-        if tasks_module and hasattr(tasks_module, 'extract_deadline_from_text'):
-            try:
-                extracted_title, deadline_dt = tasks_module.extract_deadline_from_text(raw_text)
-                if extracted_title:
-                    title = extracted_title
-                if deadline_dt:
-                    if deadline_dt.tzinfo:
-                        deadline_dt = deadline_dt.replace(tzinfo=None)
-                    deadline_iso = deadline_dt.isoformat()
-            except Exception as e:
-                logger.error(f"Ошибка extract_deadline_from_text: {e}", exc_info=True)
-        
-        context.user_data.setdefault('unified_item', {})
-        context.user_data['unified_item']['title'] = title
-        if deadline_iso:
-            context.user_data['unified_item']['deadline'] = deadline_iso
-        
-        # Формируем ответ
-        response = f"Название: {title}"
-        if deadline_iso:
-            # Красиво форматируем дедлайн через tasks_module, если можно
-            try:
-                if tasks_module and hasattr(tasks_module, 'format_deadline_readable'):
-                    from datetime import datetime as _dt
-                    dt = _dt.fromisoformat(deadline_iso)
-                    if dt.tzinfo:
-                        dt = dt.replace(tzinfo=None)
-                    response += f"\nДедлайн: {tasks_module.format_deadline_readable(dt)}"
-            except Exception:
-                pass
-        
-        await update.message.reply_text(response)
-        
-        # Если дедлайн уже найден, сразу переходим к комментарию
-        if deadline_iso:
-            await update.message.reply_text("Что-то уточним, или /skip")
-            return WAITING_UNIFIED_COMMENT
-        else:
-            await update.message.reply_text("Какой дедлайн?")
-            return WAITING_UNIFIED_DEADLINE
-    except Exception as e:
-        logger.error(f"Ошибка в unified_add_title: {e}", exc_info=True)
-        if update.message:
-            await update.message.reply_text("❌ Ошибка при обработке названия. Попробуйте ещё раз.")
-        return WAITING_UNIFIED_TITLE
-
-
-async def unified_add_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запрос/уточнение дедлайна (общий формат, через парсер задач, если есть)"""
-    try:
-        if not update.message or not update.message.text:
-            await update.message.reply_text("Пожалуйста, укажите дедлайн текстом.")
-            return WAITING_UNIFIED_DEADLINE
-        
-        text = update.message.text.strip()
-        if not text:
-            await update.message.reply_text("Пожалуйста, укажите дедлайн текстом.")
-            return WAITING_UNIFIED_DEADLINE
-        
-        tasks_module = context.application.bot_data.get('tasks_module')
-        
-        deadline_iso = None
-        if tasks_module and hasattr(tasks_module, 'parse_deadline'):
-            try:
-                # parse_deadline(text, deadline=None) -> datetime | None
-                deadline_dt = tasks_module.parse_deadline(text, None)
-                if not deadline_dt:
-                    await update.message.reply_text("Не понял дедлайн. Попробуйте другой формат (например, «сегодня 18:00» или «вторник 14:00»).")
-                    return WAITING_UNIFIED_DEADLINE
-                if deadline_dt.tzinfo:
-                    deadline_dt = deadline_dt.replace(tzinfo=None)
-                deadline_iso = deadline_dt.isoformat()
-            except Exception as e:
-                logger.error(f"Ошибка parse_deadline: {e}", exc_info=True)
-        
-        if not deadline_iso:
-            await update.message.reply_text("Не удалось распознать дедлайн. Попробуйте ещё раз.")
-            return WAITING_UNIFIED_DEADLINE
-        
-        context.user_data.setdefault('unified_item', {})
-        context.user_data['unified_item']['deadline'] = deadline_iso
-        
-        # Красиво покажем дедлайн
-        tasks_module = context.application.bot_data.get('tasks_module')
-        try:
-            from datetime import datetime as _dt
-            dt = _dt.fromisoformat(deadline_iso)
-            if dt.tzinfo:
-                dt = dt.replace(tzinfo=None)
-            if tasks_module and hasattr(tasks_module, 'format_deadline_readable'):
-                formatted = tasks_module.format_deadline_readable(dt)
-            else:
-                formatted = dt.strftime('%d.%m.%Y %H:%M')
-        except Exception:
-            formatted = deadline_iso
-        
-        await update.message.reply_text(f"Дедлайн: {formatted}")
-        await update.message.reply_text("Что-то уточним, или /skip")
-        return WAITING_UNIFIED_COMMENT
-    except Exception as e:
-        logger.error(f"Ошибка в unified_add_deadline: {e}", exc_info=True)
-        if update.message:
-            await update.message.reply_text("❌ Ошибка при обработке дедлайна. Попробуйте ещё раз.")
-        return WAITING_UNIFIED_DEADLINE
-
-
-async def unified_add_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Комментарий (или /skip)"""
-    try:
-        if update.message and update.message.text and update.message.text.strip() == '/skip':
-            comment = ''
-        else:
-            comment = (update.message.text or '').strip()
-        
-        context.user_data.setdefault('unified_item', {})
-        context.user_data['unified_item']['comment'] = comment
-        
-        # Переходим к выбору проекта
-        tasks_module = context.application.bot_data.get('tasks_module')
-        projects = []
-        if tasks_module and hasattr(tasks_module, 'get_user_projects'):
-            try:
-                projects = tasks_module.get_user_projects(str(update.effective_user.id)) or []
-            except Exception as e:
-                logger.error(f"Ошибка get_user_projects: {e}", exc_info=True)
-        
-        if projects:
-            # Показываем варианты проектов списком
-            text_lines = ["В каком проекте? Напишите название или выберите из существующих:\n"]
-            for p in projects[:20]:
-                text_lines.append(f"- {p}")
-            await update.message.reply_text("\n".join(text_lines))
-        else:
-            await update.message.reply_text("В каком проекте? (можно написать новое название)")
-        
-        return WAITING_UNIFIED_PROJECT
-    except Exception as e:
-        logger.error(f"Ошибка в unified_add_comment: {e}", exc_info=True)
-        if update.message:
-            await update.message.reply_text("❌ Ошибка при сохранении комментария. Попробуйте ещё раз.")
-        return WAITING_UNIFIED_COMMENT
-
-
-async def unified_add_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбор/ввод проекта"""
-    try:
-        if not update.message or not update.message.text:
-            await update.message.reply_text("Пожалуйста, укажите проект текстом.")
-            return WAITING_UNIFIED_PROJECT
-        
-        project = update.message.text.strip()
-        context.user_data.setdefault('unified_item', {})
-        context.user_data['unified_item']['project'] = project
-        
-        # Сохраняем проект в системе задач (чтобы он появился в списках)
-        tasks_module = context.application.bot_data.get('tasks_module')
-        if tasks_module and hasattr(tasks_module, 'add_user_project'):
-            try:
-                tasks_module.add_user_project(
-                    str(update.effective_user.id),
-                    project_name=project
-                )
-            except Exception as e:
-                logger.error(f"Ошибка add_user_project: {e}", exc_info=True)
-        
-        # Переходим к регулярности
-        keyboard = [
-            [InlineKeyboardButton("Одноразовое", callback_data="unified_recur_once")],
-            [InlineKeyboardButton("Ежедневное", callback_data="unified_recur_daily")],
-            [InlineKeyboardButton("Еженедельное", callback_data="unified_recur_weekly")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
-            "Какая регулярность?",
-            reply_markup=reply_markup
-        )
-        return WAITING_UNIFIED_RECURRENCE
-    except Exception as e:
-        logger.error(f"Ошибка в unified_add_project: {e}", exc_info=True)
-        if update.message:
-            await update.message.reply_text("❌ Ошибка при сохранении проекта. Попробуйте ещё раз.")
-        return WAITING_UNIFIED_PROJECT
-
-
-async def unified_add_recurrence(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка выбора регулярности"""
-    try:
-        query = update.callback_query
-        if not query:
-            logger.warning("unified_add_recurrence без callback_query")
-            return WAITING_UNIFIED_RECURRENCE
-        
-        await query.answer()
-        
-        recurrence = 'once'
-        data = query.data
-        if data == 'unified_recur_daily':
-            recurrence = 'daily'
-        elif data == 'unified_recur_weekly':
-            recurrence = 'weekly'
-        
-        context.user_data.setdefault('unified_item', {})
-        context.user_data['unified_item']['recurrence'] = recurrence
-        
-        # Переходим к напоминанию
-        keyboard = [
-            [InlineKeyboardButton("За час", callback_data="unified_rem_1h")],
-            [InlineKeyboardButton("За 3 часа", callback_data="unified_rem_3h")],
-            [InlineKeyboardButton("За 6 часов", callback_data="unified_rem_6h")],
-            [InlineKeyboardButton("За день", callback_data="unified_rem_1d")],
-            [InlineKeyboardButton("Без напоминания", callback_data="unified_rem_none")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            "Как напомнить?",
-            reply_markup=reply_markup
-        )
-        return WAITING_UNIFIED_REMINDER
-    except Exception as e:
-        logger.error(f"Ошибка в unified_add_recurrence: {e}", exc_info=True)
-        if update.callback_query:
-            await update.callback_query.answer("❌ Ошибка при выборе регулярности", show_alert=True)
-        return WAITING_UNIFIED_RECURRENCE
-
-
-async def unified_add_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка выбора напоминания (для задач)"""
-    try:
-        query = update.callback_query
-        if not query:
-            logger.warning("unified_add_reminder без callback_query")
-            return WAITING_UNIFIED_REMINDER
-        
-        await query.answer()
-        
-        context.user_data.setdefault('unified_item', {})
-        
-        # Сохраняем относительное напоминание в виде ISO-даты, ориентируясь на дедлайн
-        item = context.user_data['unified_item']
-        deadline_iso = item.get('deadline')
-        reminder_iso = None
-        
-        from datetime import datetime as _dt, timedelta as _td
-        if deadline_iso:
-            try:
-                deadline_dt = _dt.fromisoformat(deadline_iso)
-                if deadline_dt.tzinfo:
-                    deadline_dt = deadline_dt.replace(tzinfo=None)
+def extract_deadline_from_text(text: str) -> tuple[str, Optional[datetime]]:
+    """Извлекает дедлайн из текста и возвращает (очищенный_текст, дедлайн)"""
+    text_lower = text.lower().strip()
+    original_text = text
+    print(f"Извлечение дедлайна из текста: '{text}'")
+    
+    # Словарь числительных прописью для использования в паттернах
+    # Важно: сначала идут более длинные фразы (многословные), потом короткие
+    number_words_list = ['двадцать три', 'двадцать две', 'двадцать два', 'двадцать одна', 'двадцать один',
+                         'двадцать', 'девятнадцать', 'восемнадцать', 'семнадцать', 'шестнадцать',
+                         'пятнадцать', 'четырнадцать', 'тринадцать', 'двенадцать', 'одиннадцать',
+                         'десять', 'девять', 'восемь', 'семь', 'шесть', 'пять', 'четыре',
+                         'три', 'две', 'два', 'одну', 'одна', 'один']
+    number_words_pattern = '|'.join(number_words_list)
+    
+    # Список паттернов для поиска дедлайна (от более специфичных к менее специфичным)
+    # Каждый паттерн - это кортеж (regex_pattern, priority)
+    # priority: чем выше, тем раньше проверяется
+    deadline_patterns = [
+        # "в 16:00 послезавтра", "в 16:00 завтра", "в 16:00 сегодня" - время перед датой
+        (r'\bв\s+(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?\s+(завтра|сегодня|послезавтра)\b', 13),
+        # "завтра в 7 утра", "сегодня в 2 часа дня", "послезавтра в шесть вечера"
+        (r'\b(завтра|сегодня|послезавтра)\s+(?:в\s+)?(?:(\d{1,2})|(' + number_words_pattern + r'))(?:\s+часа?)?\s+(утра|дня|вечера|ночи)\b', 12),
+        # "7 утра", "2 часа дня", "шесть вечера" - в любом месте текста
+        (r'\b(?:(\d{1,2})|(' + number_words_pattern + r'))(?:\s+часа?)?\s+(утра|дня|вечера|ночи)\b', 11),
+        # "завтра в 14", "сегодня в 19:30", "послезавтра в 15" - в любом месте текста
+        (r'\b(завтра|сегодня|послезавтра)\s+в\s+(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?\b', 10),
+        # "вторник 14:00", "понедельник в 10:30", "пт 18:00" - день недели + время
+        (r'\b(понедельник|вторник|среда|четверг|пятница|суббота|воскресенье|пн|вт|ср|чт|пт|сб|вс)\s+(?:в\s+)?(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?\b', 10),
+        # "15 февраля в 14:00", "15 февраля в 14", "16 февраля 2026 в 15:30" - дата с временем
+        (r'\b(\d{1,2})\s+(январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|июл[ья]|август[а]?|сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья])(?:\s+(\d{4}))?\s+в\s+(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?\b', 10),
+        # "25.01.2026 18:00", "25.01.2026 в 18:00" - дата с временем
+        (r'\b(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(?:в\s+)?(\d{1,2})[:.](\d{2}))?\b', 9),
+        # "25/01/2026 18:00", "25/01/2026 в 18:00"
+        (r'\b(\d{1,2})/(\d{1,2})/(\d{4})(?:\s+(?:в\s+)?(\d{1,2})[:.](\d{2}))?\b', 9),
+        # "завтра 14", "сегодня 19:30" (без "в") - в любом месте текста
+        (r'\b(завтра|сегодня|послезавтра)\s+(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?\b', 8),
+        # "15 февраля", "16 февраля 2026" - формат с названием месяца (без времени)
+        (r'\b(\d{1,2})\s+(январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|июл[ья]|август[а]?|сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья])(?:\s+(\d{4}))?\b', 7),
+        # "через неделю", "через 3 дня"
+        (r'\bчерез\s+(\d+)\s+(недел[ияю]?|дн[яей]|месяц[аев]?)\b', 6),
+        # "через неделю" (без числа)
+        (r'\bчерез\s+недел[юя]\b', 5),
+        # "в 19:00", "в 19" - только если перед этим есть дата или в конце текста
+        (r'(?:\d{1,2}\s+(?:январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|июл[ья]|август[а]?|сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья])|завтра|сегодня|послезавтра|\d{1,2}[./]\d{1,2})\s+в\s+(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?\b', 4),
+        # "сегодня", "завтра", "послезавтра" (отдельно) - в любом месте текста
+        (r'\b(сегодня|завтра|послезавтра)\b', 3),
+        # "19:00", "19.00" (в конце текста, как время) - только формат времени с разделителем
+        (r'\b([0-2]?[0-9])[:.](\d{2})\s*$', 2),  # Только формат времени с разделителем
+    ]
+    
+    # Сортируем по приоритету (от большего к меньшему)
+    deadline_patterns.sort(key=lambda x: x[1], reverse=True)
+    
+    # Пробуем найти дедлайн, начиная с более специфичных паттернов
+    for pattern, priority in deadline_patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            # Извлекаем найденный фрагмент
+            found_text = match.group(0).strip()
+            print(f"Найден паттерн (приоритет {priority}): '{found_text}' по шаблону '{pattern}'")
+            
+            # Для паттернов с "в" и временем проверяем контекст
+            # Если это паттерн типа "(?:^|\s)в\s+", проверяем, что перед ним есть дата
+            if r'(?:^|\s)в\s+' in pattern and not r'\d{1,2}\s+(?:январ' in pattern:
+                # Проверяем, что перед "в" есть относительная дата или дата с месяцем
+                before_match = text_lower[:match.start()]
+                after_match = text_lower[match.end():]
                 
-                if query.data == 'unified_rem_1h':
-                    reminder_iso = (deadline_dt - _td(hours=1)).isoformat()
-                elif query.data == 'unified_rem_3h':
-                    reminder_iso = (deadline_dt - _td(hours=3)).isoformat()
-                elif query.data == 'unified_rem_6h':
-                    reminder_iso = (deadline_dt - _td(hours=6)).isoformat()
-                elif query.data == 'unified_rem_1d':
-                    reminder_iso = (deadline_dt - _td(days=1)).isoformat()
+                # Если после времени есть слова типа "часов", "минут", "утра", "вечера" - это не дедлайн
+                if re.search(r'\b(часов?|минут|утра|вечера|дня|ночи)\b', after_match):
+                    continue
+                
+                # Проверяем, что перед "в" есть дата (относительная или с месяцем)
+                has_date_before = (
+                    re.search(r'\b(завтра|сегодня|послезавтра)\s*$', before_match) or
+                    re.search(r'\d{1,2}\s+(?:январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|июл[ья]|август[а]?|сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья])\s*$', before_match) or
+                    re.search(r'\d{1,2}[./]\d{1,2}(?:[./]\d{4})?\s*$', before_match)
+                )
+                
+                if not has_date_before and match.end() < len(text_lower):
+                    # Пропускаем этот паттерн, если нет даты перед "в" и это не в конце
+                    continue
+            
+            # Для относительных дат без времени проверяем, что после них нет времени
+            # (чтобы не дублировать с паттернами выше, которые уже обработали "завтра в 14")
+            if pattern == r'\b(сегодня|завтра|послезавтра)\b':
+                after_match = text_lower[match.end():].strip()
+                # Если после относительной даты есть время (число или "в" + число), пропускаем
+                # так как это уже обработано паттернами выше с более высоким приоритетом
+                if re.match(r'^\s*(в\s+)?\d', after_match):
+                    print(f"Пропускаем '{found_text}' - после неё есть время, которое обработано паттерном выше")
+                    continue
+            
+            # Если найденная дата не содержит время, проверяем, есть ли время сразу после неё
+            # Это нужно для случаев типа "15 февраля в 14:00", где паттерн может найти только "15 февраля"
+            extended_text = found_text
+            extended_end = match.end()
+            
+            # Проверяем, содержит ли найденный текст время суток (утра, дня, вечера, ночи)
+            # Если да, то не нужно искать дополнительное время
+            has_time_of_day = re.search(r'\b(утра|дня|вечера|ночи)\b', found_text.lower())
+            
+            # Проверяем, есть ли время после найденной даты
+            # Это нужно для случаев, когда паттерн находит только дату, а время идет отдельно
+            if not has_time_of_day and 'в' not in found_text.lower() and not re.search(r'\d{1,2}[:.]\d{2}', found_text):
+                after_match_text = text_lower[match.end():]
+                # Ищем паттерн времени после даты: "в 14:00", "в 14", "14:00", "в 7 утра"
+                # Более гибкий паттерн для поиска времени, включая варианты с пробелами и без разделителей
+                time_patterns = [
+                    r'^\s+в\s+(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?\b',  # "в 14:00" или "в 14"
+                    r'^\s+(\d{1,2})(?:\s*[:.]\s*(\d{2}))\b',  # "14:00" или "14.00"
+                    r'^\s+(\d{1,2})\s+(\d{2})\b',  # "14 00" (время без разделителя)
+                    r'^\s+(?:в\s+)?(?:(\d{1,2})|(' + number_words_pattern + r'))(?:\s+часа?)?\s+(утра|дня|вечера|ночи)\b',  # "в 7 утра", "2 часа дня"
+                    r'^\s+(\d{1,2})\s+(?:часов?|ч|часа)\s*(?:(\d{1,2})\s*(?:минут?|м|минуты))?\b',  # "14 часов", "14 часов 30 минут"
+                    r'^\s+(\d{1,2})\s+(?:часов?|ч)\s*(?:(\d{1,2}))?\b',  # "14 часов 30", "14 часов"
+                ]
+                
+                for time_pattern in time_patterns:
+                    time_after_match = re.match(time_pattern, after_match_text)
+                    if time_after_match:
+                        # Найдено время после даты, добавляем его к найденному тексту
+                        time_text = time_after_match.group(0).strip()
+                        
+                        # Нормализуем формат времени для правильного парсинга
+                        # "14 00" -> "14:00"
+                        time_text_normalized = re.sub(r'(\d{1,2})\s+(\d{2})\b', r'\1:\2', time_text)
+                        # "14 часов 30" -> "14:30"
+                        time_text_normalized = re.sub(r'(\d{1,2})\s+часов?\s+(\d{1,2})\b', r'\1:\2', time_text_normalized)
+                        # "14 часов" -> "14:00"
+                        time_text_normalized = re.sub(r'(\d{1,2})\s+часов?\b', r'\1:00', time_text_normalized)
+                        
+                        # Если в паттерне нет "в", добавляем его для правильного парсинга
+                        if not time_text_normalized.startswith('в') and not re.search(r'\b(утра|дня|вечера|ночи)\b', time_text_normalized):
+                            extended_text = found_text + ' в ' + time_text_normalized
+                        else:
+                            extended_text = found_text + ' ' + time_text_normalized
+                        # Правильно вычисляем позицию конца расширенного текста
+                        extended_end = match.end() + time_after_match.end()
+                        print(f"Найдено время после даты: '{time_text}' -> '{time_text_normalized}', расширенный текст: '{extended_text}'")
+                        break
+            
+            # Пробуем распарсить найденный фрагмент (возможно расширенный) как дедлайн
+            # Обрезаем пробелы, чтобы паттерны в parse_deadline работали правильно
+            extended_text_clean = extended_text.strip()
+            deadline_dt = parse_deadline(extended_text_clean)
+            
+            if deadline_dt:
+                # Удаляем найденный фрагмент (возможно расширенный) из текста
+                start_pos = match.start()
+                end_pos = extended_end
+                
+                # Удаляем найденный фрагмент и очищаем пробелы
+                before_text = text[:start_pos].strip()
+                after_text = text[end_pos:].strip()
+                
+                cleaned_text = (before_text + ' ' + after_text).strip()
+                cleaned_text = re.sub(r'\s+', ' ', cleaned_text)  # Убираем множественные пробелы
+                cleaned_text = cleaned_text.strip()
+                
+                # Если текст стал пустым, оставляем исходный текст без дедлайна
+                if not cleaned_text:
+                    print(f"Текст стал пустым после удаления дедлайна, возвращаем исходный текст")
+                    return text, None
+                
+                print(f"Дедлайн найден: '{found_text}' -> {deadline_dt}, очищенный текст: '{cleaned_text}'")
+                return cleaned_text, deadline_dt
+    
+    # Если дедлайн не найден, возвращаем исходный текст
+    print(f"Дедлайн не найден в тексте: '{text}'")
+    return text, None
+
+
+def parse_deadline(deadline_str: str, deadline=None) -> Optional[datetime]:
+    """Парсинг дедлайна из строки - поддерживает множество форматов"""
+    deadline_str = deadline_str.strip().lower()
+    # Нормализуем пробелы вокруг двоеточий и точек в времени
+    deadline_str = re.sub(r'\s*([:.])\s*', r'\1', deadline_str)  # Убираем пробелы вокруг : и .
+    deadline_str = re.sub(r'\s+', ' ', deadline_str)  # Убираем множественные пробелы
+    current_time = now()
+    # Приводим к naive datetime для работы
+    if current_time.tzinfo:
+        now_dt = current_time.replace(tzinfo=None)
+    else:
+        now_dt = current_time
+    
+    # Формат "DD.MM HH:MM" (например, "02.03 18:00") — используем текущий или следующий год
+    match = re.match(r'^(\d{1,2})\.(\d{1,2})\s+(\d{1,2})[:.](\d{2})$', deadline_str)
+    if match:
+        try:
+            day = int(match.group(1))
+            month = int(match.group(2))
+            hour = int(match.group(3))
+            minute = int(match.group(4))
+            year = now_dt.year
+            if 1 <= month <= 12 and 1 <= day <= 31 and 0 <= hour <= 23 and 0 <= minute <= 59:
+                candidate = datetime(year, month, day, hour, minute, 0)
+                # Если дата/время уже прошли в этом году — переносим на следующий год
+                if candidate < now_dt:
+                    candidate = candidate.replace(year=year + 1)
+                return candidate
+        except Exception:
+            pass
+    
+    # Словарь числительных прописью
+    number_words = {
+        'один': 1, 'одна': 1, 'одну': 1,
+        'два': 2, 'две': 2,
+        'три': 3,
+        'четыре': 4,
+        'пять': 5,
+        'шесть': 6,
+        'семь': 7,
+        'восемь': 8,
+        'девять': 9,
+        'десять': 10,
+        'одиннадцать': 11,
+        'двенадцать': 12,
+        'тринадцать': 13,
+        'четырнадцать': 14,
+        'пятнадцать': 15,
+        'шестнадцать': 16,
+        'семнадцать': 17,
+        'восемнадцать': 18,
+        'девятнадцать': 19,
+        'двадцать': 20,
+        'двадцать один': 21, 'двадцать одна': 21,
+        'двадцать два': 22, 'двадцать две': 22,
+        'двадцать три': 23,
+    }
+    
+    # Паттерны для времени суток: "7 утра", "2 часа дня", "шесть вечера"
+    time_of_day_patterns = [
+        # "7 утра", "шесть утра", "2 часа утра"
+        (r'^(?:(\d{1,2})|(' + '|'.join(number_words.keys()) + r'))(?:\s+часа?)?\s+(утра|ночи)\b', 'morning'),
+        # "2 часа дня", "шесть дня", "14 дня"
+        (r'^(?:(\d{1,2})|(' + '|'.join(number_words.keys()) + r'))(?:\s+часа?)?\s+дня\b', 'afternoon'),
+        # "шесть вечера", "7 вечера", "2 часа вечера"
+        (r'^(?:(\d{1,2})|(' + '|'.join(number_words.keys()) + r'))(?:\s+часа?)?\s+вечера\b', 'evening'),
+        # "12 ночи", "полночь"
+        (r'^(?:(\d{1,2})|(' + '|'.join(number_words.keys()) + r'))(?:\s+часа?)?\s+ночи\b', 'night'),
+    ]
+    
+    # Пробуем распарсить время суток
+    for pattern, time_type in time_of_day_patterns:
+        match = re.match(pattern, deadline_str)
+        if match:
+            hour_str = match.group(1) if match.group(1) else None
+            word_str = match.group(2) if match.group(2) else None
+            
+            if hour_str:
+                hour = int(hour_str)
+            elif word_str:
+                hour = number_words.get(word_str)
+            else:
+                continue
+            
+            if hour is None:
+                continue
+            
+            # Преобразуем час в зависимости от времени суток
+            if time_type == 'morning':
+                # "утра" = 0-11 часов (AM)
+                if hour > 11:
+                    hour = hour % 12
+            elif time_type == 'afternoon':
+                # "дня" = 12-17 часов (PM, после полудня)
+                # Если указано 1-5, то это 13-17
+                # Если указано 12, то это 12
+                if hour == 0:
+                    hour = 12  # "0 часов дня" = полдень
+                elif hour < 12:
+                    hour = hour + 12  # 1-11 -> 13-23
+                    # Ограничиваем до 17 для "дня" (если больше, значит это вечер)
+                    if hour > 17:
+                        hour = hour - 12
+                # Если уже 12-17, оставляем как есть
+            elif time_type == 'evening':
+                # "вечера" = 18-23 часов (PM, вечер)
+                # Если указано 6-11, то это 18-23
+                if hour < 12:
+                    hour = hour + 12  # 6-11 -> 18-23
+                # Если уже 12-23, оставляем как есть
+            elif time_type == 'night':
+                # "ночи" = 0-5 часов (AM, ночь)
+                if hour >= 12:
+                    hour = hour % 12
+                # Если уже 0-5, оставляем как есть
+            
+            # Ограничиваем час в диапазоне 0-23
+            hour = hour % 24
+            
+            # Если время уже прошло сегодня, переносим на завтра
+            result = now_dt.replace(hour=hour, minute=0, second=0, microsecond=0)
+            if result < now_dt:
+                result += timedelta(days=1)
+            return result
+    
+    # Паттерн для формата "в 16:00 послезавтра", "в 16:00 завтра", "в 16:00 сегодня" (время перед датой)
+    time_before_date_pattern = r'^в\s+(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?\s+(завтра|сегодня|послезавтра)$'
+    match = re.match(time_before_date_pattern, deadline_str)
+    if match:
+        hour = int(match.group(1))
+        minute_str = match.group(2)
+        date_word = match.group(3)
+        
+        minute = int(minute_str) if minute_str else 0
+        
+        print(f"Парсинг формата 'время перед датой': '{deadline_str}' -> час={hour}, минута={minute}, дата={date_word}")
+        
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            days_offset = 0
+            if date_word == 'завтра':
+                days_offset = 1
+            elif date_word == 'послезавтра':
+                days_offset = 2
+            # 'сегодня' -> days_offset = 0
+            
+            result = (now_dt + timedelta(days=days_offset)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+            # Если время уже прошло в указанный день, переносим на следующий день
+            if result < now_dt:
+                result += timedelta(days=1)
+            print(f"Результат парсинга: {result}")
+            return result
+        else:
+            print(f"⚠️ Некорректное время: час={hour}, минута={minute}")
+    
+    # Паттерны для относительных дат с временем суток: "завтра в 7 утра", "сегодня в 2 часа дня"
+    relative_time_patterns = [
+        (r'^(завтра|сегодня|послезавтра)\s+(?:в\s+)?(?:(\d{1,2})|(' + '|'.join(number_words.keys()) + r'))(?:\s+часа?)?\s+(утра|дня|вечера|ночи)\b', True),
+    ]
+    
+    for pattern, _ in relative_time_patterns:
+        match = re.match(pattern, deadline_str)
+        if match:
+            date_word = match.group(1)
+            hour_str = match.group(2) if match.group(2) else None
+            word_str = match.group(3) if match.group(3) else None
+            time_of_day = match.group(4)
+            
+            if hour_str:
+                hour = int(hour_str)
+            elif word_str:
+                hour = number_words.get(word_str)
+            else:
+                continue
+            
+            if hour is None:
+                continue
+            
+            # Преобразуем час в зависимости от времени суток (та же логика, что и выше)
+            if time_of_day == 'утра':
+                # "утра" = 0-11 часов (AM)
+                if hour > 11:
+                    hour = hour % 12
+            elif time_of_day == 'дня':
+                # "дня" = 12-17 часов (PM, после полудня)
+                if hour == 0:
+                    hour = 12  # "0 часов дня" = полдень
+                elif hour < 12:
+                    hour = hour + 12  # 1-11 -> 13-23
+                    # Ограничиваем до 17 для "дня"
+                    if hour > 17:
+                        hour = hour - 12
+            elif time_of_day == 'вечера':
+                # "вечера" = 18-23 часов (PM, вечер)
+                if hour < 12:
+                    hour = hour + 12  # 6-11 -> 18-23
+            elif time_of_day == 'ночи':
+                # "ночи" = 0-5 часов (AM, ночь)
+                if hour >= 12:
+                    hour = hour % 12
+            
+            hour = hour % 24
+            
+            days_offset = 0
+            if date_word == 'завтра':
+                days_offset = 1
+            elif date_word == 'послезавтра':
+                days_offset = 2
+            
+            result = (now_dt + timedelta(days=days_offset)).replace(hour=hour, minute=0, second=0, microsecond=0)
+            if result < now_dt:
+                result += timedelta(days=1)
+            return result
+    
+    # Паттерн для формата "завтра до 18:00", "послезавтра до 14:00"
+    until_time_pattern = r'^(завтра|сегодня|послезавтра)\s+до\s+(\d{1,2})(?:[:.](\d{2}))?$'
+    match = re.match(until_time_pattern, deadline_str)
+    if match:
+        date_word = match.group(1)
+        hour = int(match.group(2))
+        minute_str = match.group(3)
+        minute = int(minute_str) if minute_str else 0
+        
+        print(f"Парсинг формата 'дата до время': '{deadline_str}' -> дата={date_word}, час={hour}, минута={minute}")
+        
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            days_offset = 0
+            if date_word == 'завтра':
+                days_offset = 1
+            elif date_word == 'послезавтра':
+                days_offset = 2
+            # 'сегодня' -> days_offset = 0
+            
+            result = (now_dt + timedelta(days=days_offset)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+            # Если время уже прошло в указанный день, переносим на следующий день
+            if result < now_dt:
+                result += timedelta(days=1)
+            print(f"Результат парсинга: {result}")
+            return result
+    
+    # Относительные даты с временем: "завтра в 14", "сегодня в 19:30", "завтра в 14:00"
+    # Также обрабатываем форматы "завтра в 14 часов 30", "завтра 14 30", "завтра в 14 часов"
+    date_time_patterns = [
+        r'^(завтра|сегодня|послезавтра)\s+в\s+(\d{1,2})\s+часов?\s+(\d{1,2})\s*(?:минут?|м)?$',  # завтра в 14 часов 30
+        r'^(завтра|сегодня|послезавтра)\s+в\s+(\d{1,2})\s+часов?$',  # завтра в 14 часов
+        r'^(завтра|сегодня|послезавтра)\s+в\s+(\d{1,2})(?:[:.](\d{2}))?$',  # завтра в 14, завтра в 14:00
+        r'^(завтра|сегодня|послезавтра)\s+(\d{1,2})\s+(\d{2})$',     # завтра 14 30
+        r'^(завтра|сегодня|послезавтра)\s+(\d{1,2})(?:[:.](\d{2}))?$',     # завтра 14, завтра 14:00
+    ]
+    
+    for pattern in date_time_patterns:
+        match = re.match(pattern, deadline_str)
+        if match:
+            date_word = match.group(1)
+            hour = int(match.group(2))
+            # Проверяем, есть ли минуты в группе 3 или 4
+            minute = 0
+            if len(match.groups()) >= 3 and match.group(3):
+                try:
+                    minute = int(match.group(3))
+                except (ValueError, TypeError):
+                    pass
+            
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                days_offset = 0
+                if date_word == 'завтра':
+                    days_offset = 1
+                elif date_word == 'послезавтра':
+                    days_offset = 2
+                # 'сегодня' -> days_offset = 0
+                
+                result = (now_dt + timedelta(days=days_offset)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+                # Если время уже прошло в указанный день, переносим на следующий день
+                if result < now_dt:
+                    result += timedelta(days=1)
+                print(f"Парсинг относительной даты с временем: '{deadline_str}' -> {result}")
+                return result
+    
+    # Только час без минут: "19" -> сегодня в 19:00
+    hour_only_pattern = r'^(\d{1,2})$'
+    match = re.match(hour_only_pattern, deadline_str)
+    if match:
+        hour = int(match.group(1))
+        if 0 <= hour <= 23:
+            result = now_dt.replace(hour=hour, minute=0, second=0, microsecond=0)
+            # Если время уже прошло сегодня, переносим на завтра
+            if result < now_dt:
+                result += timedelta(days=1)
+            return result
+    
+    # Относительные даты
+    relative_dates = {
+        'сегодня': 0,
+        'сегодняшний день': 0,
+        'завтра': 1,
+        'послезавтра': 2,
+        'через день': 1,
+        'через 2 дня': 2,
+        'через 3 дня': 3,
+        'через неделю': 7,
+        'через 2 недели': 14,
+    }
+    
+    if deadline_str in relative_dates:
+        days = relative_dates[deadline_str]
+        return (now_dt + timedelta(days=days)).replace(hour=23, minute=59, second=59, microsecond=0)
+    
+    # День недели + время: "вторник 14:00", "понедельник в 10:30", "пт 18:00"
+    weekdays_map = {
+        'понедельник': 0, 'пн': 0,
+        'вторник': 1, 'вт': 1,
+        'среда': 2, 'ср': 2,
+        'четверг': 3, 'чт': 3,
+        'пятница': 4, 'пт': 4,
+        'суббота': 5, 'сб': 5,
+        'воскресенье': 6, 'вс': 6,
+    }
+    weekday_time_pattern = r'^(понедельник|вторник|среда|четверг|пятница|суббота|воскресенье|пн|вт|ср|чт|пт|сб|вс)\s+(?:в\s+)?(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?$'
+    match = re.match(weekday_time_pattern, deadline_str)
+    if match:
+        day_name = match.group(1).lower()
+        target_weekday = weekdays_map.get(day_name)
+        if target_weekday is not None:
+            hour = int(match.group(2))
+            minute_str = match.group(3)
+            minute = int(minute_str) if minute_str else 0
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                current_weekday = now_dt.weekday()
+                days_ahead = target_weekday - current_weekday
+                if days_ahead < 0:
+                    days_ahead += 7
+                elif days_ahead == 0:
+                    # тот же день: если время уже прошло, берём следующий раз в этот день недели
+                    candidate = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    if candidate < now_dt:
+                        days_ahead = 7
+                    else:
+                        return candidate
+                if days_ahead > 0:
+                    result = (now_dt + timedelta(days=days_ahead)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    return result
+    
+    # Дни недели (только название — конец дня 23:59)
+    weekdays = {
+        'понедельник': 0,
+        'вторник': 1,
+        'среда': 2,
+        'четверг': 3,
+        'пятница': 4,
+        'суббота': 5,
+        'воскресенье': 6,
+        'пн': 0,
+        'вт': 1,
+        'ср': 2,
+        'чт': 3,
+        'пт': 4,
+        'сб': 5,
+        'вс': 6,
+    }
+    
+    if deadline_str in weekdays:
+        target_weekday = weekdays[deadline_str]
+        current_weekday = now_dt.weekday()
+        days_ahead = target_weekday - current_weekday
+        if days_ahead <= 0:
+            days_ahead += 7
+        return (now_dt + timedelta(days=days_ahead)).replace(hour=23, minute=59, second=59, microsecond=0)
+    
+    # Относительные даты с числом (через N дней/часов/минут/недель)
+    if deadline_str.startswith('через'):
+        try:
+            parts = deadline_str.split()
+            if len(parts) >= 3:
+                amount = int(parts[1])
+                unit = parts[2]
+                
+                if 'день' in unit or 'дней' in unit or 'дня' in unit:
+                    return (now_dt + timedelta(days=amount)).replace(hour=23, minute=59, second=59, microsecond=0)
+                elif 'недел' in unit or 'неделя' in unit:
+                    return (now_dt + timedelta(weeks=amount)).replace(hour=23, minute=59, second=59, microsecond=0)
+                elif 'месяц' in unit or 'месяцев' in unit or 'месяца' in unit:
+                    # Приблизительно 30 дней в месяце
+                    return (now_dt + timedelta(days=amount * 30)).replace(hour=23, minute=59, second=59, microsecond=0)
+        except:
+            pass
+    
+    # Только время (HH:MM, HH.MM, HH MM) - считаем что это сегодня
+    # Также обрабатываем форматы "14 часов 30", "14 часов", "в 14 часов 30"
+    time_only_patterns = [
+        r'^в\s+(\d{1,2})\s+часов?\s+(\d{1,2})\s*(?:минут?|м)?$',  # в 14 часов 30
+        r'^в\s+(\d{1,2})\s+часов?$',  # в 14 часов
+        r'^(\d{1,2})\s+часов?\s+(\d{1,2})\s*(?:минут?|м)?$',  # 14 часов 30
+        r'^(\d{1,2})\s+часов?$',  # 14 часов
+        r'^(\d{1,2})[:.](\d{2})$',  # 18:30 или 18.30
+        r'^(\d{1,2})\s+(\d{2})$',   # 18 30
+    ]
+    
+    for pattern in time_only_patterns:
+        match = re.match(pattern, deadline_str)
+        if match:
+            hour = int(match.group(1))
+            minute = 0
+            # Проверяем, есть ли минуты в группе 2 (для паттернов с "часов" минуты могут быть в группе 2)
+            if len(match.groups()) >= 2:
+                try:
+                    minute_str = match.group(2)
+                    if minute_str and minute_str.isdigit():
+                        minute = int(minute_str)
+                except (ValueError, TypeError, IndexError):
+                    minute = 0
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                result = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                # Если время уже прошло сегодня, переносим на завтра
+                if result < now_dt:
+                    result += timedelta(days=1)
+                print(f"Парсинг времени: '{deadline_str}' -> {result}")
+                return result
+    
+    # Различные форматы даты и времени
+    # Формат: дата + время
+    date_time_patterns = [
+        # DD.MM.YYYY HH:MM
+        r'^(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2})[:.](\d{2})$',
+        # DD/MM/YYYY HH:MM
+        r'^(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2})[:.](\d{2})$',
+        # YYYY-MM-DD HH:MM
+        r'^(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2})[:.](\d{2})$',
+        # DD-MM-YYYY HH:MM
+        r'^(\d{1,2})-(\d{1,2})-(\d{4})\s+(\d{1,2})[:.](\d{2})$',
+    ]
+    
+    for pattern in date_time_patterns:
+        match = re.match(pattern, deadline_str)
+        if match:
+            try:
+                if len(match.groups()) == 5:
+                    if '-' in deadline_str and len(match.group(1)) == 4:
+                        # YYYY-MM-DD
+                        year, month, day, hour, minute = map(int, match.groups())
+                    elif '/' in deadline_str:
+                        # DD/MM/YYYY
+                        day, month, year, hour, minute = map(int, match.groups())
+                    elif '-' in deadline_str:
+                        # DD-MM-YYYY
+                        day, month, year, hour, minute = map(int, match.groups())
+                    else:
+                        # DD.MM.YYYY
+                        day, month, year, hour, minute = map(int, match.groups())
+                    
+                    if 1 <= month <= 12 and 1 <= day <= 31 and 0 <= hour <= 23 and 0 <= minute <= 59:
+                        return datetime(year, month, day, hour, minute, 0)
+            except:
+                continue
+    
+    # Формат "15 февраля", "16 февраля" и т.д.
+    months_ru = {
+        'января': 1, 'февраля': 2, 'марта': 3, 'апреля': 4,
+        'мая': 5, 'июня': 6, 'июля': 7, 'августа': 8,
+        'сентября': 9, 'октября': 10, 'ноября': 11, 'декабря': 12,
+        'январь': 1, 'февраль': 2, 'март': 3, 'апрель': 4,
+        'май': 5, 'июнь': 6, 'июль': 7, 'август': 8,
+        'сентябрь': 9, 'октябрь': 10, 'ноябрь': 11, 'декабрь': 12
+    }
+    
+    # Паттерн для "15 февраля", "15 февраля 2026", "15 февраля 14:00", "15 февраля в 14:00"
+    date_month_patterns = [
+        r'^(\d{1,2})\s+(январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|июл[ья]|август[а]?|сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья])(?:\s+(\d{4}))?(?:\s+(?:в\s+)?(\d{1,2})(?:\s*[:.]?\s*(\d{2}))?)?$',
+    ]
+    
+    for date_month_pattern in date_month_patterns:
+        match = re.match(date_month_pattern, deadline_str)
+        if match:
+            try:
+                day = int(match.group(1))
+                month_name = match.group(2).lower()
+                year_str = match.group(3)
+                hour_str = match.group(4)
+                minute_str = match.group(5)
+                
+                if month_name in months_ru:
+                    month = months_ru[month_name]
+                    if year_str:
+                        year = int(year_str)
+                    else:
+                        year = now_dt.year
+                        # Если дата уже прошла в этом году, берем следующий год
+                        if datetime(year, month, day) < now_dt.replace(hour=0, minute=0, second=0):
+                            year += 1
+                    
+                    if 1 <= month <= 12 and 1 <= day <= 31:
+                        # Если указано время, используем его
+                        if hour_str:
+                            hour = int(hour_str)
+                            minute = int(minute_str) if minute_str else 0
+                            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                                return datetime(year, month, day, hour, minute, 0)
+                        # Иначе конец дня
+                        return datetime(year, month, day, 23, 59, 59)
+            except:
+                continue
+    
+    # Только дата (без времени) - различные форматы
+    date_only_patterns = [
+        # DD.MM.YYYY
+        r'^(\d{1,2})\.(\d{1,2})\.(\d{4})$',
+        # DD/MM/YYYY
+        r'^(\d{1,2})/(\d{1,2})/(\d{4})$',
+        # YYYY-MM-DD
+        r'^(\d{4})-(\d{1,2})-(\d{1,2})$',
+        # DD-MM-YYYY
+        r'^(\d{1,2})-(\d{1,2})-(\d{4})$',
+        # DD.MM (текущий год)
+        r'^(\d{1,2})\.(\d{1,2})$',
+        # DD/MM (текущий год)
+        r'^(\d{1,2})/(\d{1,2})$',
+    ]
+    
+    for pattern in date_only_patterns:
+        match = re.match(pattern, deadline_str)
+        if match:
+            try:
+                groups = match.groups()
+                if len(groups) == 3:
+                    if '-' in deadline_str and len(groups[0]) == 4:
+                        # YYYY-MM-DD
+                        year, month, day = map(int, groups)
+                    elif '/' in deadline_str:
+                        # DD/MM/YYYY
+                        day, month, year = map(int, groups)
+                    elif '-' in deadline_str:
+                        # DD-MM-YYYY
+                        day, month, year = map(int, groups)
+                    else:
+                        # DD.MM.YYYY
+                        day, month, year = map(int, groups)
+                elif len(groups) == 2:
+                    # DD.MM или DD/MM (текущий год)
+                    day, month = map(int, groups)
+                    year = now_dt.year
+                    # Если дата уже прошла в этом году, берем следующий год
+                    if datetime(year, month, day) < now_dt.replace(hour=0, minute=0, second=0):
+                        year += 1
+                
+                if 1 <= month <= 12 and 1 <= day <= 31:
+                    return datetime(year, month, day, 23, 59, 59)
+            except:
+                continue
+    
+    return None
+
+
+def parse_reminder(reminder_str: str, deadline: Optional[datetime] = None) -> Optional[datetime]:
+    """Парсинг напоминания из строки - поддерживает множество форматов
+    Если указан deadline, напоминания типа 'за X' вычисляются относительно дедлайна"""
+    reminder_str = reminder_str.strip().lower()
+    current_time = now()
+    # Приводим к naive datetime для работы
+    if current_time.tzinfo:
+        now_dt = current_time.replace(tzinfo=None)
+    else:
+        now_dt = current_time
+    
+    # Определяем базовую точку отсчета: если есть дедлайн и напоминание начинается с "за", используем дедлайн
+    use_deadline = deadline is not None and reminder_str.startswith('за')
+    base_time = deadline if use_deadline else now_dt
+    
+    # Относительные напоминания
+    relative_reminders = {
+        'за 15 минут': timedelta(minutes=15),
+        'через 15 минут': timedelta(minutes=15),
+        'за полчаса': timedelta(minutes=30),
+        'через полчаса': timedelta(minutes=30),
+        'за 30 минут': timedelta(minutes=30),
+        'через 30 минут': timedelta(minutes=30),
+        'за час': timedelta(hours=1),
+        'через час': timedelta(hours=1),
+        'за 2 часа': timedelta(hours=2),
+        'через 2 часа': timedelta(hours=2),
+        'за 3 часа': timedelta(hours=3),
+        'через 3 часа': timedelta(hours=3),
+        'за день': timedelta(days=1),
+        'через день': timedelta(days=1),
+        'за неделю': timedelta(weeks=1),
+        'через неделю': timedelta(weeks=1),
+    }
+    
+    if reminder_str in relative_reminders:
+        delta = relative_reminders[reminder_str]
+        if use_deadline:
+            # Вычитаем из дедлайна
+            result = base_time - delta
+        else:
+            # Добавляем к текущему времени
+            result = base_time + delta
+        
+        # Проверяем, что напоминание не в прошлом
+        if result < now_dt:
+            result = now_dt + timedelta(minutes=1)
+        return result
+    
+    # Относительные напоминания с числом (через N минут/часов/дней)
+    if reminder_str.startswith('через') or reminder_str.startswith('за'):
+        try:
+            parts = reminder_str.split()
+            if len(parts) >= 3:
+                amount = int(parts[1])
+                unit = parts[2]
+                
+                if 'минут' in unit or 'минуты' in unit or 'минуту' in unit:
+                    delta = timedelta(minutes=amount)
+                elif 'час' in unit or 'часов' in unit or 'часа' in unit:
+                    delta = timedelta(hours=amount)
+                elif 'день' in unit or 'дней' in unit or 'дня' in unit:
+                    delta = timedelta(days=amount)
+                elif 'недел' in unit or 'неделя' in unit or 'недели' in unit:
+                    delta = timedelta(weeks=amount)
+                else:
+                    return None
+                
+                if use_deadline:
+                    # Вычитаем из дедлайна
+                    result = base_time - delta
+                else:
+                    # Добавляем к текущему времени
+                    result = base_time + delta
+                
+                # Проверяем, что напоминание не в прошлом
+                if result < now_dt:
+                    result = now_dt + timedelta(minutes=1)
+                return result
+        except:
+            pass
+    
+    # Только время (HH:MM, HH.MM) - считаем что это сегодня
+    time_patterns = [
+        r'^(\d{1,2})[:.](\d{2})$',  # 18:30 или 18.30
+        r'^(\d{1,2})\s+(\d{2})$',   # 18 30
+    ]
+    
+    for pattern in time_patterns:
+        match = re.match(pattern, reminder_str)
+        if match:
+            hour = int(match.group(1))
+            minute = int(match.group(2))
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                result = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                # Если время уже прошло сегодня, переносим на завтра
+                if result < now_dt:
+                    result += timedelta(days=1)
+                return result
+    
+    # Различные форматы даты и времени (используем ту же логику что и для дедлайна)
+    date_time_patterns = [
+        r'^(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2})[:.](\d{2})$',
+        r'^(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2})[:.](\d{2})$',
+        r'^(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2})[:.](\d{2})$',
+        r'^(\d{1,2})-(\d{1,2})-(\d{4})\s+(\d{1,2})[:.](\d{2})$',
+    ]
+    
+    for pattern in date_time_patterns:
+        match = re.match(pattern, reminder_str)
+        if match:
+            try:
+                if len(match.groups()) == 5:
+                    if '-' in reminder_str and len(match.group(1)) == 4:
+                        year, month, day, hour, minute = map(int, match.groups())
+                    elif '/' in reminder_str:
+                        day, month, year, hour, minute = map(int, match.groups())
+                    elif '-' in reminder_str:
+                        day, month, year, hour, minute = map(int, match.groups())
+                    else:
+                        day, month, year, hour, minute = map(int, match.groups())
+                    
+                    if 1 <= month <= 12 and 1 <= day <= 31 and 0 <= hour <= 23 and 0 <= minute <= 59:
+                        return datetime(year, month, day, hour, minute, 0)
+            except:
+                continue
+    
+    # Только дата (без времени)
+    date_patterns = [
+        r'^(\d{1,2})\.(\d{1,2})\.(\d{4})$',
+        r'^(\d{1,2})/(\d{1,2})/(\d{4})$',
+        r'^(\d{4})-(\d{1,2})-(\d{1,2})$',
+        r'^(\d{1,2})-(\d{1,2})-(\d{4})$',
+        r'^(\d{1,2})\.(\d{1,2})$',
+        r'^(\d{1,2})/(\d{1,2})$',
+    ]
+    
+    for pattern in date_patterns:
+        match = re.match(pattern, reminder_str)
+        if match:
+            try:
+                groups = match.groups()
+                if len(groups) == 3:
+                    if '-' in reminder_str and len(groups[0]) == 4:
+                        year, month, day = map(int, groups)
+                    elif '/' in reminder_str:
+                        day, month, year = map(int, groups)
+                    elif '-' in reminder_str:
+                        day, month, year = map(int, groups)
+                    else:
+                        day, month, year = map(int, groups)
+                elif len(groups) == 2:
+                    day, month = map(int, groups)
+                    year = now_dt.year
+                    if datetime(year, month, day) < now_dt.replace(hour=0, minute=0, second=0):
+                        year += 1
+                
+                if 1 <= month <= 12 and 1 <= day <= 31:
+                    return datetime(year, month, day, 9, 0, 0)  # По умолчанию 9:00
+            except:
+                continue
+    
+    return None
+
+
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    keyboard = get_main_keyboard()
+    await update.message.reply_text("🧌", reply_markup=keyboard)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
+    help_text = (
+        "<b>Справка по командам:</b>\n\n"
+        "<b>/add</b> - Добавить новую задачу\n"
+        "  Процесс:\n"
+        "  1. Название задачи\n"
+        "  2. Комментарий (или /skip)\n"
+        "  3. Выбор проекта (кнопками)\n"
+        "  4. Дедлайн (или /skip)\n"
+        "  5. Напоминание (или /skip)\n"
+        "  6. Регулярность (одноразовая/ежедневная/еженедельная)\n\n"
+        "<b>/list</b> - Показать все задачи\n\n"
+        "<b>/projects</b> - Показать все проекты\n\n"
+        "<b>/addproject</b> - Добавить новый проект\n\n"
+        "<b>/stats</b> - Показать статистику\n\n"
+        "<b>/cancel</b> - Отменить текущую операцию\n\n"
+        "<b>Форматы дедлайна:</b>\n"
+        "• Сегодня\n"
+        "• Завтра\n"
+        "• 25.01.2026\n"
+        "• 25.01.2026 18:00\n"
+        "• Через 3 дня\n\n"
+        "<b>Форматы напоминания:</b>\n"
+        "• За час\n"
+        "• За 2 часа\n"
+        "• За день\n"
+        "• Через 30 минут\n"
+        "• 25.01.2026 18:00\n\n"
+        "<b>Регулярность задачи:</b>\n"
+        "• Одноразовая - задача выполняется один раз\n"
+        "• Ежедневная - задача повторяется каждый день\n"
+        "• Еженедельная - задача повторяется каждую неделю"
+    )
+    await update.message.reply_text(help_text, parse_mode='HTML')
+
+
+# ========== ОБРАБОТЧИКИ ДОБАВЛЕНИЯ ЗАДАЧИ ==========
+
+async def save_bot_message(message, context: ContextTypes.DEFAULT_TYPE):
+    """Сохраняет message_id сообщения бота для последующего удаления"""
+    if 'bot_messages' not in context.user_data:
+        context.user_data['bot_messages'] = []
+    if message:
+        context.user_data['bot_messages'].append(message.message_id)
+
+async def save_user_message(message, context: ContextTypes.DEFAULT_TYPE):
+    """Сохраняет message_id сообщения пользователя для последующего удаления"""
+    if 'user_messages' not in context.user_data:
+        context.user_data['user_messages'] = []
+    if message:
+        context.user_data['user_messages'].append(message.message_id)
+
+async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало добавления задачи"""
+    context.user_data.clear()
+    context.user_data['bot_messages'] = []  # Список для хранения message_id сообщений бота
+    context.user_data['user_messages'] = []  # Список для хранения message_id сообщений пользователя
+    # Сохраняем сообщение пользователя, которое запустило процесс
+    await save_user_message(update.message, context)
+    msg = await update.message.reply_text("Какая задача?")
+    await save_bot_message(msg, context)
+    return WAITING_TASK_TITLE
+
+
+async def add_task_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение названия задачи (текст или голос)"""
+    # Сохраняем сообщение пользователя
+    await save_user_message(update.message, context)
+    
+    task_title = None
+    raw_text = None
+    
+    # Проверяем голосовое сообщение
+    if update.message.voice:
+        print(f"Получено голосовое сообщение: duration={update.message.voice.duration}, file_id={update.message.voice.file_id}")
+        
+        # Пробуем использовать caption от Telegram (если есть)
+        if update.message.caption:
+            raw_text = update.message.caption.strip()
+            print(f"Использован caption от Telegram: {raw_text}")
+            # Нормализуем caption для лучшего парсинга дедлайнов
+            raw_text = normalize_voice_text(raw_text)
+        elif VOICE_SUPPORT:
+            try:
+                print("Получение файла голосового сообщения...")
+                voice_file = await update.message.voice.get_file()
+                print(f"Файл получен: file_path={voice_file.file_path}, file_size={voice_file.file_size}")
+                
+                print("Начало распознавания голосового сообщения...")
+                transcribed_text = await transcribe_voice(voice_file, update)
+                
+                if transcribed_text:
+                    raw_text = transcribed_text.strip()
+                    print(f"✅ Успешно распознано: {raw_text}")
+                else:
+                    print("❌ Не удалось распознать голосовое сообщение")
+                    await update.message.reply_text(
+                        "Не удалось распознать голосовое сообщение.\n\n"
+                        "💡 Попробуйте:\n"
+                        "• Говорить четче и медленнее\n"
+                        "• Уменьшить фоновый шум\n"
+                        "• Написать текст вместо голосового сообщения"
+                    )
+                    return WAITING_TASK_TITLE
             except Exception as e:
-                logger.error(f"Ошибка вычисления времени напоминания: {e}", exc_info=True)
+                print(f"❌ Ошибка при обработке голосового сообщения: {e}")
+                import traceback
+                traceback.print_exc()
+                await update.message.reply_text("Ошибка обработки голосового сообщения. Попробуйте написать текст:")
+                return WAITING_TASK_TITLE
+        else:
+            # Если модули не установлены, просто просим повторить текстом
+            await update.message.reply_text("Повторите текстом:")
+            return WAITING_TASK_TITLE
+    elif update.message.text:
+        raw_text = update.message.text.strip()
+    
+    if not raw_text:
+        await update.message.reply_text("Ошибка: Название задачи не может быть пустым. Попробуйте снова:")
+        return WAITING_TASK_TITLE
+    
+    # Пытаемся извлечь дедлайн из текста
+    task_title, deadline_dt = extract_deadline_from_text(raw_text)
+    
+    # Если дедлайн найден, сохраняем его
+    if deadline_dt:
+        context.user_data['task_deadline'] = deadline_dt.isoformat()
+        print(f"Дедлайн извлечен из текста: {deadline_dt}")
+    
+    if not task_title:
+        await update.message.reply_text("Ошибка: Название задачи не может быть пустым. Попробуйте снова:")
+        return WAITING_TASK_TITLE
+    
+    context.user_data['task_title'] = task_title
+    
+    # Формируем ответное сообщение
+    response_text = f"Задача: {task_title}"
+    if deadline_dt:
+        deadline_formatted = format_deadline_readable(deadline_dt)
+        response_text += f"\nДедлайн: {deadline_formatted}"
+    
+    msg = await update.message.reply_text(response_text)
+    await save_bot_message(msg, context)
+    print(f"Сохранена задача: '{task_title}', дедлайн: {deadline_dt}")
+    
+    # Проверяем, есть ли уже дедлайн из названия задачи
+    if 'task_deadline' in context.user_data and context.user_data['task_deadline']:
+        # Дедлайн уже есть, переходим к комментарию
+        print("Дедлайн найден, переходим к комментарию")
+        msg = await update.message.reply_text("Что-то уточним, или /skip")
+        await save_bot_message(msg, context)
+        return WAITING_TASK_COMMENT
+    else:
+        # Дедлайна нет, спрашиваем его
+        print("Дедлайн не найден, спрашиваем его")
+        msg = await update.message.reply_text("Когда?")
+        await save_bot_message(msg, context)
+        return WAITING_TASK_DEADLINE
+
+
+async def add_task_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение комментария задачи (текст или голос)"""
+    print(f"[DEBUG] add_task_comment вызвана")
+    print(f"[DEBUG] update.message: {update.message is not None}")
+    
+    # Проверяем, есть ли сообщение
+    if not update.message:
+        print("[DEBUG] Ошибка: update.message отсутствует")
+        return WAITING_TASK_COMMENT
+    
+    print(f"[DEBUG] update.message.text: {update.message.text if hasattr(update.message, 'text') else 'N/A'}")
+    print(f"[DEBUG] update.message.voice: {update.message.voice is not None if hasattr(update.message, 'voice') else 'N/A'}")
+    
+    # Сохраняем сообщение пользователя
+    await save_user_message(update.message, context)
+    
+    text = None
+    
+    # Проверяем голосовое сообщение
+    if hasattr(update.message, 'voice') and update.message.voice:
+        print(f"Получено голосовое сообщение для комментария: duration={update.message.voice.duration}, file_id={update.message.voice.file_id}")
         
-        if query.data == 'unified_rem_none':
-            reminder_iso = None
+        # Пробуем использовать caption от Telegram (если есть)
+        if update.message.caption:
+            text = update.message.caption.strip()
+            print(f"Использован caption от Telegram для комментария: {text}")
+            # Нормализуем caption для лучшего парсинга
+            text = normalize_voice_text(text)
+        elif VOICE_SUPPORT:
+            try:
+                print("Получение файла голосового сообщения для комментария...")
+                voice_file = await update.message.voice.get_file()
+                print(f"Файл получен: file_path={voice_file.file_path}, file_size={voice_file.file_size}")
+                
+                print("Начало распознавания голосового сообщения для комментария...")
+                transcribed_text = await transcribe_voice(voice_file, update)
+                
+                if transcribed_text:
+                    text = transcribed_text.strip()
+                    print(f"✅ Успешно распознано для комментария: {text}")
+                    await update.message.reply_text(text)
+                else:
+                    print("❌ Не удалось распознать голосовое сообщение для комментария")
+                    await update.message.reply_text(
+                        "Не удалось распознать голосовое сообщение.\n\n"
+                        "💡 Попробуйте:\n"
+                        "• Говорить четче и медленнее\n"
+                        "• Написать текст или /skip"
+                    )
+                    return WAITING_TASK_COMMENT
+            except Exception as e:
+                print(f"❌ Ошибка при обработке голосового сообщения для комментария: {e}")
+                import traceback
+                traceback.print_exc()
+                await update.message.reply_text("Ошибка обработки голосового сообщения. Попробуйте написать текст:")
+                return WAITING_TASK_COMMENT
+        else:
+            # Если модули не установлены, просто просим повторить текстом
+            await update.message.reply_text("Повторите текстом или /skip:")
+            return WAITING_TASK_COMMENT
+    elif hasattr(update.message, 'text') and update.message.text:
+        text = update.message.text.strip()
+        print(f"Получен текст для комментария: {text}")
+    else:
+        # Если это команда /skip через CommandHandler, text будет None
+        print("Команда /skip или пустое сообщение")
+        text = None
+    
+    try:
+        # Обрабатываем /skip или пустой текст
+        if not text or text.lower() == '/skip' or text.lower() == 'skip':
+            context.user_data['task_comment'] = None
+            print("Комментарий пропущен (/skip)")
+        else:
+            context.user_data['task_comment'] = text
+            print(f"Комментарий сохранен: {text}")
         
-        item['reminder'] = reminder_iso
+        # Получаем проекты пользователя
+        user_id = update.effective_user.id
+        try:
+            projects = get_user_projects(str(user_id))
+            print(f"Найдено проектов: {len(projects)}")
+            # Убеждаемся, что projects - это список строк
+            if not isinstance(projects, list):
+                print(f"[WARNING] get_user_projects вернул не список: {type(projects)}")
+                projects = []
+            # Фильтруем только строки
+            projects = [p for p in projects if isinstance(p, str) and p.strip()]
+            print(f"Проектов после фильтрации: {len(projects)}")
+        except Exception as e:
+            print(f"[ERROR] Ошибка при получении проектов: {e}")
+            import traceback
+            traceback.print_exc()
+            projects = []
         
-        # Финальный шаг – выбор, что это: событие или задача
-        keyboard = [
-            [InlineKeyboardButton("📅 Событие", callback_data="unified_type_event")],
-            [InlineKeyboardButton("✅ Задачи", callback_data="unified_type_task")]
-        ]
+        if not projects:
+            # Если проектов нет, создаем задачу без проекта
+            context.user_data['task_project'] = None
+            print("Проектов нет, переходим к напоминаниям")
+            # Переходим к напоминаниям
+            keyboard = [
+                [InlineKeyboardButton("За час", callback_data="reminder_1h")],
+                [InlineKeyboardButton("За 3 часа", callback_data="reminder_3h")],
+                [InlineKeyboardButton("За 6 часов", callback_data="reminder_6h")],
+                [InlineKeyboardButton("За день", callback_data="reminder_1d")],
+                [InlineKeyboardButton("Пропустить", callback_data="skip_reminder")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            msg = await update.message.reply_text(
+                "Напоминание:",
+                reply_markup=reply_markup
+            )
+            await save_bot_message(msg, context)
+            print("Возвращаем WAITING_TASK_REMINDER")
+            return WAITING_TASK_REMINDER
+        
+        # Показываем проекты кнопками
+        print("Показываем список проектов")
+        keyboard = []
+        for project in projects:
+            # Обрезаем длинные имена проектов для callback_data (лимит 64 байта)
+            prefix = "project_"
+            max_project_bytes = 64 - len(prefix.encode('utf-8')) - 1  # -1 для безопасности
+            
+            project_bytes = project.encode('utf-8')
+            if len(project_bytes) > max_project_bytes:
+                # Если название слишком длинное, обрезаем его по байтам
+                truncated_bytes = project_bytes[:max_project_bytes]
+                # Убираем неполные символы в конце
+                try:
+                    project_callback = truncated_bytes.decode('utf-8')
+                except UnicodeDecodeError:
+                    # Если последний байт неполный, убираем его
+                    project_callback = truncated_bytes[:-1].decode('utf-8')
+                callback_data = f"{prefix}{project_callback}"
+            else:
+                callback_data = f"{prefix}{project}"
+            
+            keyboard.append([InlineKeyboardButton(project, callback_data=callback_data)])
+        keyboard.append([InlineKeyboardButton("Пропустить", callback_data="skip_project")])
+        
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            "Что это?",
+        msg = await update.message.reply_text(
+            "К какому проекту относится?",
             reply_markup=reply_markup
         )
-        return WAITING_UNIFIED_TYPE
+        await save_bot_message(msg, context)
+        print("Возвращаем WAITING_TASK_PROJECT")
+        return WAITING_TASK_PROJECT
     except Exception as e:
-        logger.error(f"Ошибка в unified_add_reminder: {e}", exc_info=True)
-        if update.callback_query:
-            await update.callback_query.answer("❌ Ошибка при выборе напоминания", show_alert=True)
-        return WAITING_UNIFIED_REMINDER
+        print(f"[ERROR] Ошибка в add_task_comment: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            if update.message:
+                await update.message.reply_text("Произошла ошибка. Попробуйте снова или отправьте /skip:")
+        except Exception as e2:
+            print(f"[ERROR] Не удалось отправить сообщение об ошибке: {e2}")
+        return WAITING_TASK_COMMENT
 
 
-async def unified_choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Финальный выбор: сохранить как событие или как задачу"""
+async def add_task_project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора проекта через кнопки"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "skip_project":
+        context.user_data['task_project'] = None
+        # Переходим к напоминаниям
+        keyboard = [
+            [InlineKeyboardButton("За час", callback_data="reminder_1h")],
+            [InlineKeyboardButton("За 3 часа", callback_data="reminder_3h")],
+            [InlineKeyboardButton("За 6 часов", callback_data="reminder_6h")],
+            [InlineKeyboardButton("За день", callback_data="reminder_1d")],
+            [InlineKeyboardButton("Пропустить", callback_data="skip_reminder")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("Напоминание:", parse_mode='HTML')
+        msg = await query.message.reply_text("Напоминание:", reply_markup=reply_markup)
+        await save_bot_message(msg, context)
+        return WAITING_TASK_REMINDER
+    elif query.data == "new_project":
+        await query.edit_message_text(
+            "Введите название нового проекта:"
+        )
+        return WAITING_TASK_PROJECT
+    else:
+        project_name = query.data.replace('project_', '')
+        context.user_data['task_project'] = project_name
+        # Переходим к напоминаниям
+        keyboard = [
+            [InlineKeyboardButton("За час", callback_data="reminder_1h")],
+            [InlineKeyboardButton("За 3 часа", callback_data="reminder_3h")],
+            [InlineKeyboardButton("За 6 часов", callback_data="reminder_6h")],
+            [InlineKeyboardButton("За день", callback_data="reminder_1d")],
+            [InlineKeyboardButton("Пропустить", callback_data="skip_reminder")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(f"Проект: <b>{project_name}</b>\n\nНапоминание:", parse_mode='HTML')
+        msg = await query.message.reply_text("Напоминание:", reply_markup=reply_markup)
+        await save_bot_message(msg, context)
+        return WAITING_TASK_REMINDER
+
+
+async def add_task_project_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Создание нового проекта из текста"""
+    # Сохраняем сообщение пользователя
+    await save_user_message(update.message, context)
+    
+    project_name = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    if not project_name:
+        await update.message.reply_text("Ошибка: Название проекта не может быть пустым. Попробуйте снова:")
+        return WAITING_TASK_PROJECT
+    
+    # Создаем проект
+    add_user_project(str(user_id), project_name)
+    context.user_data['task_project'] = project_name
+    
+    # Переходим к напоминаниям
+    keyboard = [
+        [InlineKeyboardButton("За час", callback_data="reminder_1h")],
+        [InlineKeyboardButton("За 3 часа", callback_data="reminder_3h")],
+        [InlineKeyboardButton("За 6 часов", callback_data="reminder_6h")],
+        [InlineKeyboardButton("За день", callback_data="reminder_1d")],
+        [InlineKeyboardButton("Пропустить", callback_data="skip_reminder")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    msg1 = await update.message.reply_text(
+        f"Проект <b>{project_name}</b> создан!\n\nНапоминание:",
+        parse_mode='HTML'
+    )
+    await save_bot_message(msg1, context)
+    msg2 = await update.message.reply_text("Напоминание:", reply_markup=reply_markup)
+    await save_bot_message(msg2, context)
+    return WAITING_TASK_REMINDER
+
+
+async def add_task_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение дедлайна задачи (текст или голос)"""
+    # Сохраняем сообщение пользователя
+    await save_user_message(update.message, context)
+    
+    text = None
+    
+    # Проверяем голосовое сообщение
+    if update.message.voice:
+        # Пробуем использовать caption от Telegram (если есть)
+        if update.message.caption:
+            text = update.message.caption.strip()
+        elif VOICE_SUPPORT:
+            voice_file = await update.message.voice.get_file()
+            transcribed_text = await transcribe_voice(voice_file, update)
+            
+            if transcribed_text:
+                text = transcribed_text.strip()
+                await update.message.reply_text(text)
+            else:
+                await update.message.reply_text(
+                    "Не удалось распознать голосовое сообщение.\n\n"
+                    "💡 Попробуйте:\n"
+                    "• Говорить четче и медленнее\n"
+                    "• Написать дедлайн текстом или /skip"
+                )
+                return WAITING_TASK_DEADLINE
+        else:
+            # Если модули не установлены, просто просим повторить текстом
+            await update.message.reply_text("Повторите текстом или /skip:")
+            return WAITING_TASK_DEADLINE
+    elif update.message.text:
+        text = update.message.text.strip()
+    
+    # Проверяем команду /skip
+    if not text or text.lower() == '/skip' or text.lower() == 'skip':
+        deadline = None
+    else:
+        deadline_dt = parse_deadline(text)
+        if deadline_dt is None:
+            await update.message.reply_text(
+                "Ошибка: Неверный формат даты. Попробуйте снова или отправьте /skip:"
+            )
+            return WAITING_TASK_DEADLINE
+        deadline = deadline_dt.isoformat()
+    
+    context.user_data['task_deadline'] = deadline
+    
+    # После дедлайна переходим к комментарию
+    msg = await update.message.reply_text("Что-то уточним, или /skip")
+    await save_bot_message(msg, context)
+    return WAITING_TASK_COMMENT
+
+
+async def add_task_reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора напоминания через кнопки"""
+    query = update.callback_query
+    await query.answer()
+    
+    reminder = None
+    
+    # Получаем дедлайн задачи
+    deadline_str = context.user_data.get('task_deadline')
+    
+    if query.data == "skip_reminder":
+        reminder = None
+    elif deadline_str:
+        # Если есть дедлайн, вычисляем напоминание относительно дедлайна
+        deadline_dt = datetime.fromisoformat(deadline_str)
+        
+        if query.data == "reminder_1h":
+            reminder = (deadline_dt - timedelta(hours=1)).isoformat()
+        elif query.data == "reminder_3h":
+            reminder = (deadline_dt - timedelta(hours=3)).isoformat()
+        elif query.data == "reminder_6h":
+            reminder = (deadline_dt - timedelta(hours=6)).isoformat()
+        elif query.data == "reminder_1d":
+            reminder = (deadline_dt - timedelta(days=1)).isoformat()
+        
+        # Проверяем, что напоминание не в прошлом
+        if reminder:
+            reminder_dt = datetime.fromisoformat(reminder)
+            current_time = now()
+            if current_time.tzinfo:
+                current_time = current_time.replace(tzinfo=None)
+            if reminder_dt < current_time:
+                # Если напоминание в прошлом, устанавливаем на текущее время + небольшой интервал
+                reminder = (current_time + timedelta(minutes=1)).isoformat()
+    else:
+        # Если дедлайна нет, вычисляем относительно текущего времени
+        current_time = now()
+        if current_time.tzinfo:
+            now_dt = current_time.replace(tzinfo=None)
+        else:
+            now_dt = current_time
+        if query.data == "reminder_1h":
+            reminder = (now_dt + timedelta(hours=1)).isoformat()
+        elif query.data == "reminder_3h":
+            reminder = (now_dt + timedelta(hours=3)).isoformat()
+        elif query.data == "reminder_6h":
+            reminder = (now_dt + timedelta(hours=6)).isoformat()
+        elif query.data == "reminder_1d":
+            reminder = (now_dt + timedelta(days=1)).isoformat()
+    
+    # Сохраняем напоминание и переходим к выбору регулярности
+    context.user_data['task_reminder'] = reminder
+    
+    # Показываем меню выбора регулярности
+    keyboard = [
+        [InlineKeyboardButton("Одноразовая", callback_data="recurrence_once")],
+        [InlineKeyboardButton("Ежедневная", callback_data="recurrence_daily")],
+        [InlineKeyboardButton("Еженедельная", callback_data="recurrence_weekly")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("Регулярность:", parse_mode='HTML')
+    msg = await query.message.reply_text("Регулярность:", reply_markup=reply_markup)
+    await save_bot_message(msg, context)
+    
+    return WAITING_TASK_RECURRENCE
+
+
+async def add_task_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение напоминания задачи (fallback для текстового ввода)"""
+    # Сохраняем сообщение пользователя
+    await save_user_message(update.message, context)
+    
+    text = update.message.text.strip()
+    
+    # Проверяем команду /skip
+    if text.lower() == '/skip' or text.lower() == 'skip':
+        reminder = None
+    else:
+        # Получаем дедлайн для вычисления напоминания относительно него
+        deadline_str = context.user_data.get('task_deadline')
+        deadline_dt = None
+        if deadline_str:
+            deadline_dt = datetime.fromisoformat(deadline_str)
+        
+        reminder_dt = parse_reminder(text, deadline_dt)
+        if reminder_dt is None:
+            await update.message.reply_text(
+                "Ошибка: Неверный формат напоминания. Попробуйте снова или отправьте /skip:\n\n"
+                "Примеры: 'за час', 'за 2 часа', '25.01.2026 18:00'"
+            )
+            return WAITING_TASK_REMINDER
+        reminder = reminder_dt.isoformat()
+    
+    # Сохраняем напоминание и переходим к выбору регулярности
+    context.user_data['task_reminder'] = reminder
+    
+    # Показываем меню выбора регулярности
+    keyboard = [
+        [InlineKeyboardButton("Одноразовая", callback_data="recurrence_once")],
+        [InlineKeyboardButton("Ежедневная", callback_data="recurrence_daily")],
+        [InlineKeyboardButton("Еженедельная", callback_data="recurrence_weekly")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    msg = await update.message.reply_text("Регулярность:", reply_markup=reply_markup)
+    await save_bot_message(msg, context)
+    
+    return WAITING_TASK_RECURRENCE
+
+
+async def add_task_recurrence_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора регулярности через кнопки"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Определяем тип регулярности
+    recurrence_map = {
+        "recurrence_once": "once",
+        "recurrence_daily": "daily",
+        "recurrence_weekly": "weekly"
+    }
+    
+    recurrence = recurrence_map.get(query.data, "once")
+    context.user_data['task_recurrence'] = recurrence
+    
+    # После выбора регулярности предлагаем выбрать категорию
+    keyboard = [
+        [InlineKeyboardButton("📅 событие", callback_data="task_category_event")],
+        [InlineKeyboardButton("✅ задача", callback_data="task_category_task")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = (
+        "Выбери категорию для этого пункта плана:\n\n"
+        "📅 событие — если это конкретное событие во времени\n"
+        "✅ задача — если это просто задача без жёсткой привязки к событию"
+    )
+    
+    await query.edit_message_text(text, reply_markup=reply_markup)
+    return WAITING_TASK_CATEGORY
+
+
+async def add_task_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор категории задачи (📅 событие или ✅ задача) и финальное создание задачи"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "task_category_event":
+        category = "event"
+    else:
+        category = "task"
+    
+    context.user_data['task_category'] = category
+    
+    # Берём итоговое название задачи без добавления служебных эмодзи
+    task_title = context.user_data.get('task_title', '')
+    
+    # Создаем задачу
+    user_id = update.effective_user.id
+    current_time = now()
+    if current_time.tzinfo:
+        current_time_naive = current_time.replace(tzinfo=None)
+    else:
+        current_time_naive = current_time
+    
+    task = {
+        'id': f"{current_time_naive.timestamp()}",
+        'title': task_title,
+        'comment': context.user_data.get('task_comment'),
+        'project': context.user_data.get('task_project'),
+        'category': context.user_data.get('task_category', 'task'),
+        'deadline': context.user_data.get('task_deadline'),
+        'reminder': context.user_data.get('task_reminder'),
+        'recurrence': context.user_data.get('task_recurrence', 'once'),
+        'completed': False,
+        'created_at': current_time_naive.isoformat(),
+        'source': 'tasks'  # Добавляем источник создания задачи
+    }
+    
+    save_user_task(str(user_id), task)
+    
+    text = "✅\n"
+    text += f"{task['title']}\n"
+    if task.get('deadline'):
+        deadline_dt = datetime.fromisoformat(task['deadline'])
+        deadline_formatted = format_deadline_readable(deadline_dt)
+        text += f"Дедлайн: {deadline_formatted}\n"
+    if task.get('project'):
+        text += f"Проект: {task['project']}\n"
+    
+    recurrence_names = {
+        'once': 'Одноразовая',
+        'daily': 'Ежедневная',
+        'weekly': 'Еженедельная'
+    }
+    text += f"Регулярность: {recurrence_names.get(task['recurrence'], 'Одноразовая')}\n"
+    
+    # Сохраняем списки сообщений для удаления перед очисткой context
+    bot_messages = context.user_data.get('bot_messages', [])
+    user_messages = context.user_data.get('user_messages', [])
+    bot_messages.append(query.message.message_id)  # Добавляем текущее сообщение бота
+    
+    # Сохраняем message_id для удаления
+    done_message = None
     try:
-        query = update.callback_query
-        if not query:
-            logger.warning("unified_choose_type без callback_query")
+        keyboard = get_main_keyboard()
+        await query.edit_message_text(text, parse_mode='HTML')
+        done_message = await query.message.reply_text("Готово!", reply_markup=keyboard)
+        if done_message:
+            bot_messages.append(done_message.message_id)
+    except Exception as e:
+        print(f"Ошибка при отправке сообщения: {e}")
+    
+    # Удаляем всю историю сообщений (и бота, и пользователя)
+    try:
+        chat_id = query.message.chat_id
+        
+        # Удаляем сообщения бота
+        for msg_id in bot_messages:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except Exception as e:
+                print(f"Не удалось удалить сообщение бота {msg_id}: {e}")
+                # Продолжаем удаление остальных сообщений
+        
+        # Пытаемся удалить сообщения пользователя
+        # Примечание: в личном чате бот не может удалять сообщения пользователя,
+        # но попробуем на случай, если это группа или канал
+        for msg_id in user_messages:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except Exception as e:
+                # В личном чате это нормально - бот не может удалять сообщения пользователя
+                # Просто игнорируем ошибку
+                pass
+    except Exception as e:
+        print(f"Ошибка при удалении сообщений: {e}")
+    
+    # Очищаем context и вызываем /start
+    context.user_data.clear()
+    
+    # Вызываем команду /start - отправляем главное меню
+    keyboard = get_main_keyboard()
+    await query.message.reply_text("🧌", reply_markup=keyboard)
+    
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена операции"""
+    context.user_data.clear()
+    keyboard = get_main_keyboard()
+    await update.message.reply_text("Операция отменена.", reply_markup=keyboard)
+    return ConversationHandler.END
+
+
+# ========== ОБРАБОТЧИКИ СПИСКА ЗАДАЧ ==========
+
+async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать список задач с кнопками"""
+    user_id = update.effective_user.id
+    tasks = get_user_tasks(str(user_id))
+    
+    if not tasks:
+        await update.message.reply_text("У вас пока нет задач.\nИспользуйте /add для добавления задачи.")
+        return
+    
+    text = f"<b>Ваши задачи</b> ({len(tasks)}):\n\n"
+    
+    recurrence_names = {
+        'once': 'Одноразовая',
+        'daily': 'Ежедневная',
+        'weekly': 'Еженедельная'
+    }
+    
+    keyboard = []
+    
+    for i, task in enumerate(tasks, 1):
+        completed = task.get('completed', False)
+        if completed:
+            status = "✅"
+            task_title = f"<s>{task['title']}</s>"
+        else:
+            status = "⏳"
+            task_title = f"<b>{task['title']}</b>"
+        
+        text += f"{i}. {status} {task_title}\n"
+        if task.get('comment'):
+            text += f"   Комментарий: {task['comment']}\n"
+        if task.get('project'):
+            text += f"   Проект: {task['project']}\n"
+        if task.get('deadline'):
+            deadline_dt = datetime.fromisoformat(task['deadline'])
+            deadline_formatted = format_deadline_readable(deadline_dt)
+            text += f"   Дедлайн: {deadline_formatted}\n"
+        if task.get('reminder'):
+            reminder_dt = datetime.fromisoformat(task['reminder'])
+            text += f"   Напоминание: {reminder_dt.strftime('%d.%m.%Y %H:%M')}\n"
+        recurrence = task.get('recurrence', 'once')
+        text += f"   Регулярность: {recurrence_names.get(recurrence, 'Одноразовая')}\n"
+        text += "\n"
+        
+        # Добавляем кнопку для задачи (только если не выполнена)
+        if not completed:
+            task_id = task.get('id', '')
+            # Обрезаем название задачи для кнопки, если слишком длинное
+            button_text = task['title'][:40] + "..." if len(task['title']) > 40 else task['title']
+            keyboard.append([InlineKeyboardButton(f"{i}. {button_text}", callback_data=f"task_complete_{task_id}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
+
+
+async def task_complete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатия на кнопку задачи"""
+    query = update.callback_query
+    
+    try:
+        task_id = query.data.replace("task_complete_", "")
+        user_id = query.from_user.id
+        task = get_user_task_by_id(str(user_id), task_id)
+        
+        if not task:
+            await query.answer("Задача не найдена", show_alert=True)
             return ConversationHandler.END
         
         await query.answer()
         
-        item = context.user_data.get('unified_item') or {}
-        title = item.get('title') or "Без названия"
-        deadline_iso = item.get('deadline')
-        comment = item.get('comment') or ""
-        project = item.get('project') or ""
-        recurrence = item.get('recurrence', 'once')
-        reminder_iso = item.get('reminder')
+        # Сохраняем task_id в context для последующего использования
+        context.user_data['task_id'] = task_id
+        context.user_data['task_title'] = task.get('title', '')
         
-        user_id = query.from_user.id
+        # Сохраняем период расписания из context (если есть)
+        schedule_period = context.user_data.get('current_schedule_period')
+        context.user_data['schedule_period'] = schedule_period
         
-        if query.data == 'unified_type_event':
-            # Сохраняем как событие расписания
-            schedule_module = context.application.bot_data.get('schedule_module')
-            if not schedule_module:
-                await query.edit_message_text("❌ Модуль расписания недоступен")
-                return ConversationHandler.END
+        # Показываем вопрос "готово?"
+        keyboard = [
+            [InlineKeyboardButton("Да", callback_data="task_confirm_yes")],
+            [InlineKeyboardButton("Нет", callback_data="task_confirm_no")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            f"Задача: <b>{task['title']}</b>\n\n"
+            "Готово?",
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+        return WAITING_TASK_COMPLETE_CONFIRM
+    except Exception as e:
+        print(f"Ошибка в task_complete_callback: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            await query.answer("Произошла ошибка", show_alert=True)
+        except:
+            pass
+        return ConversationHandler.END
+
+
+async def task_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка подтверждения выполнения задачи"""
+    query = update.callback_query
+    await query.answer()
+    
+    task_id = context.user_data.get('task_id')
+    task_title = context.user_data.get('task_title', '')
+    schedule_period = context.user_data.get('schedule_period')  # Сохраняем период расписания
+    user_id = query.from_user.id
+    
+    if query.data == "task_confirm_yes":
+        # Получаем задачу для проверки времени
+        task = get_user_task_by_id(str(user_id), task_id)
+        warning_text = ""
+        
+        # Проверяем, есть ли у задачи конкретное время (не конец дня)
+        if task and task.get('deadline'):
+            deadline_dt = datetime.fromisoformat(task['deadline'])
+            if deadline_dt.tzinfo:
+                deadline_dt = deadline_dt.replace(tzinfo=None)
             
-            from datetime import datetime as _dt
-            if not deadline_iso:
-                await query.edit_message_text("❌ Для события нужен дедлайн (дата и время)")
-                return ConversationHandler.END
-            
-            dt = _dt.fromisoformat(deadline_iso)
-            if dt.tzinfo:
-                dt = dt.replace(tzinfo=None)
-            
-            date_str = dt.strftime('%Y-%m-%d')
-            time_str = dt.strftime('%H:%M')
-            
-            event = {
-                'title': title,
-                'date': date_str,
-                'time': time_str,
-                'description': comment,
-                'category': project or 'other',
-                'repeat_type': recurrence,
-                'reminders': [],
-                'source': 'schedule'
-            }
-            
-            # Преобразуем напоминание в минуты до события, если оно есть
-            if reminder_iso:
-                try:
-                    rem_dt = _dt.fromisoformat(reminder_iso)
-                    if rem_dt.tzinfo:
-                        rem_dt = rem_dt.replace(tzinfo=None)
-                    delta_min = int((dt - rem_dt).total_seconds() // 60)
-                    if delta_min > 0:
-                        event['reminders'] = [delta_min]
-                except Exception as e:
-                    logger.error(f"Ошибка вычисления reminders для события: {e}", exc_info=True)
-            
-            try:
-                # Используем функцию сохранения из schedule_module
-                if hasattr(schedule_module, 'save_user_event'):
-                    schedule_module.save_user_event(str(user_id), event)
-                else:
-                    # fallback: напрямую работаем с файлом schedule_data.json
-                    import json
-                    data_file = DATA_DIR / 'schedule_data.json'
-                    if os.path.exists(data_file):
-                        with open(data_file, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                    else:
-                        data = {}
-                    user_events = data.get(str(user_id), [])
-                    user_events.append(event)
-                    data[str(user_id)] = user_events
-                    # Гарантируем существование директории данных
-                    data_file.parent.mkdir(parents=True, exist_ok=True)
-                    with open(data_file, 'w', encoding='utf-8') as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
-                
-                await query.edit_message_text(
-                    f"📅 Событие сохранено:\n\n<u>{time_str}</u> - {title}",
-                    parse_mode='HTML'
-                )
-            except Exception as e:
-                logger.error(f"Ошибка сохранения события: {e}", exc_info=True)
-                await query.edit_message_text("❌ Ошибка при сохранении события")
-        else:
-            # Сохраняем как задачу
-            tasks_module = context.application.bot_data.get('tasks_module')
-            if not tasks_module:
-                await query.edit_message_text("❌ Модуль задач недоступен")
-                return ConversationHandler.END
-            
-            from datetime import datetime as _dt
-            current_time = _dt.now()
+            # Проверяем, выполняется ли задача раньше запланированного времени
+            current_time = now()
             if current_time.tzinfo:
                 current_time = current_time.replace(tzinfo=None)
             
-            task = {
-                'id': f"{current_time.timestamp()}",
-                'title': title,
-                'comment': comment or None,
-                'project': project or None,
-                'deadline': deadline_iso,
-                'reminder': reminder_iso,
-                'recurrence': recurrence,
-                'completed': False,
-                'created_at': current_time.isoformat(),
-                'source': 'tasks'
-            }
-            
-            try:
-                if hasattr(tasks_module, 'save_user_task'):
-                    tasks_module.save_user_task(str(user_id), task)
-                else:
-                    # fallback: прямое сохранение в tasks_data.json
-                    import json
-                    data_file = DATA_DIR / 'tasks_data.json'
-                    if os.path.exists(data_file):
-                        with open(data_file, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
+            # Если задача имеет конкретное время (не 23:59) и выполняется раньше
+            if deadline_dt.hour != 23 or deadline_dt.minute != 59:
+                if current_time < deadline_dt:
+                    time_diff = deadline_dt - current_time
+                    hours = int(time_diff.total_seconds() // 3600)
+                    minutes = int((time_diff.total_seconds() % 3600) // 60)
+                    if hours > 0:
+                        warning_text = f"\n\n✅ Выполнено раньше срока на {hours} ч. {minutes} мин."
+                    elif minutes > 0:
+                        warning_text = f"\n\n✅ Выполнено раньше срока на {minutes} мин."
                     else:
-                        data = {}
-                    users = data.setdefault('users', {})
-                    user_data = users.setdefault(str(user_id), {'tasks': [], 'projects': [], 'tags': [], 'projects_data': {}})
-                    user_data.setdefault('tasks', []).append(task)
-                    # Гарантируем существование директории данных
-                    data_file.parent.mkdir(parents=True, exist_ok=True)
-                    with open(data_file, 'w', encoding='utf-8') as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
-                
-            except Exception as e:
-                logger.error(f"Ошибка сохранения задачи: {e}", exc_info=True)
-                await query.edit_message_text("❌ Ошибка при сохранении задачи")
-                return ConversationHandler.END
-            
-            await query.edit_message_text(
-                f"✅ Задача сохранена:\n\n<b>{title}</b>",
-                parse_mode='HTML'
-            )
+                        warning_text = f"\n\n✅ Выполнено раньше срока"
         
-        # Очищаем временные данные
-        context.user_data.pop('unified_item', None)
+        # Помечаем задачу как выполненную
+        update_user_task(str(user_id), task_id, {'completed': True})
+        
+        await query.edit_message_text(
+            f"✅ Задача <b>{task_title}</b> выполнена!{warning_text}",
+            parse_mode='HTML'
+        )
+        
+        # Если задача была из расписания, возвращаем к расписанию того же периода
+        if schedule_period:
+            # Обновляем расписание того же периода
+            await refresh_schedule(query, context, schedule_period, str(user_id))
+        else:
+            # Иначе отправляем обновленный список задач
+            await send_updated_task_list(query.message, str(user_id))
+        
+        context.user_data.clear()
         return ConversationHandler.END
-    except Exception as e:
-        logger.error(f"Ошибка в unified_choose_type: {e}", exc_info=True)
-        if update.callback_query:
-            await update.callback_query.answer("❌ Ошибка при сохранении", show_alert=True)
-        return ConversationHandler.END
+    
+    elif query.data == "task_confirm_no":
+        # Спрашиваем о переносе дедлайна
+        await query.edit_message_text(
+            f"Задача: <b>{task_title}</b>\n\n"
+            "Перенести на:",
+            parse_mode='HTML'
+        )
+        return WAITING_TASK_RESCHEDULE
 
-def get_combined_plan(user_id: str, schedule_module: Optional[Any], tasks_module: Optional[Any], 
-                      days: int = 1, start_date_offset: int = 0) -> Tuple[List[Dict], List[Dict]]:
-    """Получить объединенный план на указанное количество дней
+
+async def task_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка переноса дедлайна задачи"""
+    task_id = context.user_data.get('task_id')
+    task_title = context.user_data.get('task_title', '')
+    user_id = update.effective_user.id
     
-    Args:
-        user_id: ID пользователя
-        schedule_module: Модуль расписания (может быть None)
-        tasks_module: Модуль задач (может быть None)
-        days: Количество дней для плана
-        start_date_offset: Смещение начала периода (0 = сегодня, 1 = завтра и т.д.)
+    text = None
     
-    Returns:
-        Кортеж (events, tasks) - списки событий и задач
-    """
-    from datetime import datetime, timedelta
-    
-    # Получаем события из расписания
-    events = []
-    if schedule_module and hasattr(schedule_module, 'get_user_events'):
-        try:
-            events = schedule_module.get_user_events(str(user_id))
-            if not isinstance(events, list):
-                logger.warning(f"get_user_events вернул не список для пользователя {user_id}")
-                events = []
-        except Exception as e:
-            logger.error(f"Ошибка при получении событий для пользователя {user_id}: {e}", exc_info=True)
-            events = []
-    
-    # Получаем задачи
-    tasks = []
-    if tasks_module:
-        try:
-            # Пробуем использовать get_user_tasks если доступна (предпочтительный метод)
-            if hasattr(tasks_module, 'get_user_tasks'):
-                tasks = tasks_module.get_user_tasks(str(user_id))
-                if not isinstance(tasks, list):
-                    logger.warning(f"get_user_tasks вернул не список для пользователя {user_id}")
-                    tasks = []
-            elif hasattr(tasks_module, 'load_data'):
-                # Альтернативный способ через load_data
-                tasks_data = tasks_module.load_data()
-                if not isinstance(tasks_data, dict):
-                    logger.warning(f"load_data вернул не словарь")
-                    tasks_data = {}
-                
-                # Проверяем разные структуры данных
-                if 'users' in tasks_data:
-                    # Структура: {'users': {user_id: {'tasks': [...]}}}
-                    user_data = tasks_data.get('users', {}).get(str(user_id), {})
-                    if isinstance(user_data, dict):
-                        tasks = user_data.get('tasks', [])
-                elif str(user_id) in tasks_data:
-                    # Структура: {user_id: {'tasks': [...]}} или {user_id: [...]}
-                    user_tasks_data = tasks_data.get(str(user_id), {})
-                    if isinstance(user_tasks_data, dict):
-                        tasks = user_tasks_data.get('tasks', [])
-                    elif isinstance(user_tasks_data, list):
-                        tasks = user_tasks_data
-            
-            # Фильтруем только незавершенные задачи
-            tasks = [t for t in tasks if isinstance(t, dict) and not t.get('completed', False)]
-        except Exception as e:
-            logger.error(f"Ошибка при получении задач для пользователя {user_id}: {e}", exc_info=True)
-            tasks = []
-    
-    # Фильтруем по дате
-    try:
-        now = datetime.now()
-        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        start_date = today + timedelta(days=start_date_offset)
-        end_date = start_date + timedelta(days=days)
-    except Exception as e:
-        logger.error(f"Ошибка при вычислении дат: {e}", exc_info=True)
-        return [], []
-    
-    # Фильтруем события
-    filtered_events = []
-    for event in events:
-        if not isinstance(event, dict):
-            logger.warning(f"Событие не является словарем: {event}")
-            continue
-        
-        try:
-            event_date_str = event.get('date', '')
-            if not event_date_str:
-                continue
-            event_date = datetime.strptime(event_date_str, '%Y-%m-%d').date()
-            if start_date.date() <= event_date < end_date.date():
-                filtered_events.append(event)
-        except ValueError as e:
-            logger.warning(f"Неверный формат даты события '{event_date_str}': {e}")
-            continue
-        except Exception as e:
-            logger.error(f"Ошибка при фильтрации события: {e}, event: {event}", exc_info=True)
-            continue
-    
-    # Фильтруем задачи (включая задачи без дедлайна для больших периодов)
-    # Завершенные задачи уже отфильтрованы выше
-    filtered_tasks = []
-    tasks_without_deadline = []
-    
-    for task in tasks:
-        if not isinstance(task, dict):
-            logger.warning(f"Задача не является словарем: {task}")
-            continue
-        
-        # Дополнительная проверка на завершенность (на случай если фильтрация выше не сработала)
-        if task.get('completed', False):
-            continue
-        
-        deadline = task.get('deadline')
-        if deadline:
+    # Проверяем голосовое сообщение
+    if update.message.voice:
+        # Пробуем использовать caption от Telegram (если есть)
+        if update.message.caption:
+            text = update.message.caption.strip()
+            text = normalize_voice_text(text)
+        elif VOICE_SUPPORT:
             try:
-                if isinstance(deadline, str):
-                    # Пробуем разные форматы дедлайна
-                    task_date = None
-                    # Формат ISO с временем: 2026-02-09T16:30:00
-                    if 'T' in deadline:
-                        task_date = datetime.fromisoformat(deadline.replace('Z', '+00:00')).date()
-                    # Формат только даты: 2026-02-09
-                    elif len(deadline) == 10 and deadline.count('-') == 2:
-                        task_date = datetime.strptime(deadline, '%Y-%m-%d').date()
-                    else:
-                        # Пробуем другие форматы
-                        try:
-                            task_date = datetime.fromisoformat(deadline).date()
-                        except ValueError:
-                            logger.debug(f"Не удалось распарсить дедлайн '{deadline}'")
-                            continue
-                    
-                    if task_date and start_date.date() <= task_date < end_date.date():
-                        filtered_tasks.append(task)
+                voice_file = await update.message.voice.get_file()
+                transcribed_text = await transcribe_voice(voice_file, update)
+                if transcribed_text:
+                    text = transcribed_text.strip()
+                    await update.message.reply_text(text)
                 else:
-                    logger.debug(f"Дедлайн задачи не является строкой: {type(deadline)}")
-                    continue
-            except ValueError as e:
-                logger.warning(f"Неверный формат дедлайна задачи '{deadline}': {e}")
-                continue
+                    await update.message.reply_text(
+                        "Не удалось распознать голосовое сообщение. Попробуйте написать текстом:"
+                    )
+                    return WAITING_TASK_RESCHEDULE
             except Exception as e:
-                logger.error(f"Ошибка при фильтрации задачи с дедлайном '{deadline}': {e}", exc_info=True)
-                continue
+                print(f"Ошибка при обработке голосового сообщения: {e}")
+                await update.message.reply_text("Ошибка обработки голосового сообщения. Попробуйте написать текстом:")
+                return WAITING_TASK_RESCHEDULE
         else:
-            # Задачи без дедлайна показываем только для больших периодов (неделя и больше)
-            if days >= 7:
-                tasks_without_deadline.append(task)
+            await update.message.reply_text("Повторите текстом:")
+            return WAITING_TASK_RESCHEDULE
+    elif update.message.text:
+        text = update.message.text.strip()
     
-    # Добавляем задачи без дедлайна в конец списка
-    filtered_tasks.extend(tasks_without_deadline)
+    if not text:
+        await update.message.reply_text("Ошибка: Введите дату. Попробуйте снова:")
+        return WAITING_TASK_RESCHEDULE
     
-    logger.debug(f"Получен план для пользователя {user_id}: {len(filtered_events)} событий, {len(filtered_tasks)} задач")
-    return filtered_events, filtered_tasks
-
-def format_combined_plan_text(events: List[Dict], tasks: List[Dict], period_name: str) -> str:
-    """Форматирование объединенного плана в текст - объединяет события и задачи по датам
+    # Парсим новый дедлайн
+    deadline_dt = parse_deadline(text)
+    if deadline_dt is None:
+        await update.message.reply_text(
+            "Ошибка: Неверный формат даты. Попробуйте снова:\n\n"
+            "Примеры: 'завтра', '15 февраля', '15.02.2026 18:00'"
+        )
+        return WAITING_TASK_RESCHEDULE
     
-    Args:
-        events: Список событий
-        tasks: Список задач
-        period_name: Название периода (например, "сегодня", "неделю")
+    # Обновляем дедлайн задачи
+    update_user_task(str(user_id), task_id, {'deadline': deadline_dt.isoformat()})
     
-    Returns:
-        Отформатированный текст плана
-    """
-    from datetime import datetime
+    deadline_formatted = format_deadline_readable(deadline_dt)
+    schedule_period = context.user_data.get('schedule_period')
     
-    try:
-        text = f"📋 <b>План на {period_name}</b>\n\n"
-        
-        # Считаем события и задачи так же, как выводим их ниже:
-        # события = события расписания + задачи с category == 'event'
-        # задачи  = остальные задачи
-        events_from_tasks = [
-            t for t in tasks
-            if isinstance(t, dict) and t.get('deadline') and t.get('category') == 'event'
-        ]
-        pure_tasks = [
-            t for t in tasks
-            if isinstance(t, dict) and not (t.get('deadline') and t.get('category') == 'event')
-        ]
-        
-        events_count = len(events) + len(events_from_tasks)
-        tasks_count = len(pure_tasks)
-        total_count = events_count + tasks_count
-        
-        if total_count == 0:
-            text += "Нет событий и задач на этот период."
-            return text
-        
-        # Красивое описание количества дел
-        if events_count == 0:
-            events_part = "нет событий"
-        elif events_count == 1:
-            events_part = "одно событие"
-        else:
-            events_part = f"{events_count} событий"
-        
-        if tasks_count == 0:
-            tasks_part = "нет задач"
-        elif tasks_count == 1:
-            tasks_part = "одна задача"
-        else:
-            tasks_part = f"{tasks_count} задач"
-        
-        text += f"Всего дел: <b>{total_count}</b> ({events_part} и {tasks_part})\n\n"
-    except Exception as e:
-        logger.error(f"Ошибка при форматировании заголовка плана: {e}", exc_info=True)
-        return f"❌ Ошибка при форматировании плана на {period_name}"
+    await update.message.reply_text(
+        f"✅ Дедлайн задачи <b>{task_title}</b> перенесен на {deadline_formatted}",
+        parse_mode='HTML'
+    )
     
-    # Объединяем события и задачи в один список по датам
-    items_by_date = {}
-    
-    # Добавляем события (ВСЕГДА из раздела Расписание)
-    for event in events[:200]:  # Ограничиваем до 200 событий
-        date_str = event.get('date', '')
-        if date_str:
-            # Устанавливаем источник по умолчанию для старых событий
-            if 'source' not in event:
-                event['source'] = 'schedule'
-            if date_str not in items_by_date:
-                items_by_date[date_str] = {'events': [], 'tasks': []}
-            items_by_date[date_str]['events'].append(event)
-    
-    # Добавляем задачи с дедлайном
-    tasks_with_deadline = [t for t in tasks if isinstance(t, dict) and t.get('deadline')]
-    for task in tasks_with_deadline[:200]:  # Ограничиваем до 200 задач
-        deadline = task.get('deadline', '')
-        if deadline:
-            # Извлекаем дату из дедлайна (может быть ISO формат с временем)
-            deadline_date_str = deadline
-            try:
-                if 'T' in deadline:
-                    # ISO формат с временем: извлекаем только дату
-                    deadline_date = datetime.fromisoformat(deadline.replace('Z', '+00:00')).date()
-                    deadline_date_str = deadline_date.strftime('%Y-%m-%d')
-                elif len(deadline) > 10:
-                    # Пробуем извлечь дату из других форматов
-                    try:
-                        deadline_date = datetime.fromisoformat(deadline).date()
-                        deadline_date_str = deadline_date.strftime('%Y-%m-%d')
-                    except:
-                        pass
-            except Exception as e:
-                print(f"Ошибка при парсинге дедлайна '{deadline}': {e}")
-                pass
-            
-            # Устанавливаем источник по умолчанию для старых задач
-            if 'source' not in task:
-                task['source'] = 'tasks'
-            if deadline_date_str not in items_by_date:
-                items_by_date[deadline_date_str] = {'events': [], 'tasks': []}
-            items_by_date[deadline_date_str]['tasks'].append(task)
-    
-    # Выводим объединенный план по датам
-    try:
-        # Вспомогательная функция для возможной очистки служебных символов из названия
-        def _clean_title(title: str) -> str:
-            if not isinstance(title, str):
-                return title
-            return title
-        
-        first_date = True
-        for date_str in sorted(items_by_date.keys()):
-            # Форматируем дату в формат "10.02, вт"
-            try:
-                date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-                # День недели на русском
-                weekdays_ru = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
-                weekday_short = weekdays_ru[date_obj.weekday()]
-                formatted_date = f"{date_obj.strftime('%d.%m')}, {weekday_short}"
-            except ValueError:
-                logger.warning(f"Неверный формат даты '{date_str}'")
-                formatted_date = date_str
-            
-            # Для первой даты не добавляем перенос строки перед ней
-            if first_date:
-                text += f"<b>{formatted_date}</b>\n"
-                first_date = False
-            else:
-                text += f"\n<b>{formatted_date}</b>\n"
-            
-            date_items = items_by_date[date_str]
-            
-            # Объединяем события и задачи в один список с временем
-            all_items = []
-            
-            # Добавляем события (из раздела Расписание)
-            for event in date_items.get('events', []):
-                if not isinstance(event, dict):
-                    continue
-                time_str = event.get('time', '00:00')
-                title = event.get('title', 'Без названия')
-                title = _clean_title(title)
-                description = event.get('description', '')
-                category = event.get('category', '')
-                source = event.get('source', 'schedule')  # По умолчанию 'schedule' для событий
-                all_items.append({
-                    'time': time_str,
-                    'title': title,
-                    'comment': description,
-                    'project': category,  # Используем category как project для событий
-                    'type': 'event',
-                    'source': source
-                })
-            
-            # Добавляем задачи (из раздела Задачи)
-            for task in date_items.get('tasks', []):
-                if not isinstance(task, dict):
-                    continue
-                task_deadline = task.get('deadline', '')
-                time_str = '00:00'
-                if task_deadline and 'T' in task_deadline:
-                    try:
-                        deadline_dt = datetime.fromisoformat(task_deadline.replace('Z', '+00:00'))
-                        time_str = deadline_dt.strftime('%H:%M')
-                    except (ValueError, AttributeError):
-                        pass
-                
-                title = task.get('title', 'Без названия')
-                comment = task.get('comment', '')
-                project = task.get('project', '')
-                source = task.get('source', 'tasks')  # По умолчанию 'tasks' для задач
-                category = task.get('category', 'task')
-                
-                # Категория "event" в задачах считается событием плана
-                if category == 'event':
-                    all_items.append({
-                        'time': time_str,
-                        'title': _clean_title(title),
-                        'comment': comment,
-                        'project': project,
-                        'type': 'event',
-                        'source': source
-                    })
-                else:
-                    all_items.append({
-                        'time': time_str,
-                        'title': _clean_title(title),
-                        'comment': comment,
-                        'project': project,
-                        'type': 'task',
-                        'source': source
-                    })
-            
-            # Сортируем: сначала события (schedule + задачи категории event), затем обычные задачи, внутри по времени
-            all_items.sort(
-                key=lambda x: (
-                    x.get('type') != 'event',                  # все события (event) раньше задач
-                    x.get('source', 'unknown') != 'schedule',  # внутри событий: расписание раньше задач-category-event
-                    x.get('time', '00:00')
-                )
-            )
-            
-            # Разделяем события и задачи для наглядного вывода
-            events_items = [item for item in all_items if item.get('type') == 'event']
-            tasks_items = [item for item in all_items if item.get('type') == 'task']
-            
-            # Сначала выводим события (если есть)
-            if events_items:
-                text += " / 📅 Расписание\n\n"
-                for item in events_items:
-                    time_str = item.get('time', '00:00')
-                    title = item.get('title', 'Без названия')
-                    comment = item.get('comment', '')
-                    project = item.get('project', '')
-                    
-                    # Время (подчёркнутое) и название на одной строке
-                    text += f"<u>{time_str}</u> - {title}\n"
-                    
-                    # Комментарий и проект на следующих строках (если есть)
-                    if comment:
-                        text += f"<i>{comment}</i>\n"
-                    if project:
-                        text += f"{project}\n"
-                    
-                    # Пустая строка между делами
-                    text += "\n"
-            
-            # Затем выводим задачи (если есть)
-            if tasks_items:
-                text += "/✅ Задачи \n\n"
-                for item in tasks_items:
-                    time_str = item.get('time', '00:00')
-                    title = _clean_title(item.get('title', 'Без названия'))
-                    comment = item.get('comment', '')
-                    project = item.get('project', '')
-
-                    # Время (подчёркнутое) и название на одной строке
-                    text += f"<u>{time_str}</u> - {title}\n"
-                    
-                    # Комментарий и проект на следующих строках (если есть)
-                    if comment:
-                        text += f"<i>{comment}</i>\n"
-                    if project:
-                        text += f"{project}\n"
-                    
-                    # Пустая строка между делами
-                    text += "\n"
-    except Exception as e:
-        logger.error(f"Ошибка при форматировании плана по датам: {e}", exc_info=True)
-        text += "\n❌ Ошибка при форматировании плана"
-    
-    # Задачи без дедлайна (показываем отдельно в конце)
-    try:
-        tasks_without_deadline = [t for t in tasks if isinstance(t, dict) and not t.get('deadline')]
-        if tasks_without_deadline:
-            text += "\nдедлайн сегодня:\n"
-            for task in tasks_without_deadline[:50]:
-                if not isinstance(task, dict):
-                    continue
-                title = _clean_title(task.get('title', 'Без названия'))
-                comment = task.get('comment', '')
-                project = task.get('project', '')
-                
-                # Название на одной строке
-                text += f"{title}\n"
-                
-                # Комментарий и проект на следующих строках (если есть)
-                if comment:
-                    text += f"<i>{comment}</i>\n"
-                if project:
-                    text += f"{project}\n"
-                
-                # Пустая строка между делами
-                text += "\n"
-            
-            if len(tasks_without_deadline) > 50:
-                text += f"\n... и еще {len(tasks_without_deadline) - 50} задач\n"
-    except Exception as e:
-        logger.error(f"Ошибка при форматировании задач без дедлайна: {e}", exc_info=True)
-    
-    return text
-
-async def show_plan_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """План на сегодня"""
-    try:
-        if not update.message:
-            logger.warning("show_plan_today вызван без сообщения")
-            return
-        
-        user_id = update.effective_user.id
-        schedule_module = context.application.bot_data.get('schedule_module')
-        tasks_module = context.application.bot_data.get('tasks_module')
-        
-        events, tasks = get_combined_plan(user_id, schedule_module, tasks_module, days=1)
-        text = format_combined_plan_text(events, tasks, "сегодня")
-        
-        keyboard = [
-            [KeyboardButton("📅 План на сегодня")],
-            [KeyboardButton("📅 План на завтра")],
-            [KeyboardButton("📅 План на неделю")],
-            [KeyboardButton("📅 План на месяц")],
-            [KeyboardButton("📅 План на год")],
-            [KeyboardButton("📅 План на 3 года")],
-            [KeyboardButton("🏠 Главное меню")]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
-    except Exception as e:
-        logger.error(f"Ошибка при показе плана на сегодня: {e}", exc_info=True)
-        try:
-            if update.message:
-                await update.message.reply_text(
-                    "❌ Ошибка при загрузке плана на сегодня",
-                    reply_markup=get_plan_keyboard()
-                )
-        except Exception:
-            pass
-
-async def show_plan_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """План на завтра"""
-    try:
-        if not update.message:
-            logger.warning("show_plan_tomorrow вызван без сообщения")
-            return
-        
-        user_id = update.effective_user.id
-        schedule_module = context.application.bot_data.get('schedule_module')
-        tasks_module = context.application.bot_data.get('tasks_module')
-        
-        # План на завтра = с завтрашнего дня на 1 день
-        events, tasks = get_combined_plan(user_id, schedule_module, tasks_module, days=1, start_date_offset=1)
-        text = format_combined_plan_text(events, tasks, "завтра")
-        
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=get_plan_keyboard())
-    except Exception as e:
-        logger.error(f"Ошибка при показе плана на завтра: {e}", exc_info=True)
-        try:
-            if update.message:
-                await update.message.reply_text(
-                    "❌ Ошибка при загрузке плана на завтра",
-                    reply_markup=get_plan_keyboard()
-                )
-        except Exception:
-            pass
-
-async def show_plan_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """План на неделю"""
-    try:
-        if not update.message:
-            logger.warning("show_plan_week вызван без сообщения")
-            return
-        
-        user_id = update.effective_user.id
-        schedule_module = context.application.bot_data.get('schedule_module')
-        tasks_module = context.application.bot_data.get('tasks_module')
-        
-        events, tasks = get_combined_plan(user_id, schedule_module, tasks_module, days=7)
-        text = format_combined_plan_text(events, tasks, "неделю")
-        
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=get_plan_keyboard())
-    except Exception as e:
-        logger.error(f"Ошибка при показе плана на неделю: {e}", exc_info=True)
-        try:
-            if update.message:
-                await update.message.reply_text(
-                    "❌ Ошибка при загрузке плана на неделю",
-                    reply_markup=get_plan_keyboard()
-                )
-        except Exception:
-            pass
-
-async def show_plan_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """План на месяц"""
-    try:
-        if not update.message:
-            logger.warning("show_plan_month вызван без сообщения")
-            return
-        
-        user_id = update.effective_user.id
-        schedule_module = context.application.bot_data.get('schedule_module')
-        tasks_module = context.application.bot_data.get('tasks_module')
-        
-        events, tasks = get_combined_plan(user_id, schedule_module, tasks_module, days=30)
-        text = format_combined_plan_text(events, tasks, "месяц")
-        
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=get_plan_keyboard())
-    except Exception as e:
-        logger.error(f"Ошибка при показе плана на месяц: {e}", exc_info=True)
-        try:
-            if update.message:
-                await update.message.reply_text(
-                    "❌ Ошибка при загрузке плана на месяц",
-                    reply_markup=get_plan_keyboard()
-                )
-        except Exception:
-            pass
-
-async def show_plan_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """План на год"""
-    try:
-        if not update.message:
-            logger.warning("show_plan_year вызван без сообщения")
-            return
-        
-        user_id = update.effective_user.id
-        schedule_module = context.application.bot_data.get('schedule_module')
-        tasks_module = context.application.bot_data.get('tasks_module')
-        
-        events, tasks = get_combined_plan(user_id, schedule_module, tasks_module, days=365)
-        text = format_combined_plan_text(events, tasks, "год")
-        
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=get_plan_keyboard())
-    except Exception as e:
-        logger.error(f"Ошибка при показе плана на год: {e}", exc_info=True)
-        try:
-            if update.message:
-                await update.message.reply_text(
-                    "❌ Ошибка при загрузке плана на год",
-                    reply_markup=get_plan_keyboard()
-                )
-        except Exception:
-            pass
-
-async def show_plan_3years(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """План на 3 года"""
-    try:
-        if not update.message:
-            logger.warning("show_plan_3years вызван без сообщения")
-            return
-        
-        user_id = update.effective_user.id
-        schedule_module = context.application.bot_data.get('schedule_module')
-        tasks_module = context.application.bot_data.get('tasks_module')
-        
-        events, tasks = get_combined_plan(user_id, schedule_module, tasks_module, days=1095)  # 3 года
-        text = format_combined_plan_text(events, tasks, "3 года")
-        
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=get_plan_keyboard())
-    except Exception as e:
-        logger.error(f"Ошибка при показе плана на 3 года: {e}", exc_info=True)
-        try:
-            if update.message:
-                await update.message.reply_text(
-                    "❌ Ошибка при загрузке плана на 3 года",
-                    reply_markup=get_plan_keyboard()
-                )
-        except Exception:
-            pass
-
-async def show_tasks_management_from_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать список задач для управления из раздела План"""
-    # Определяем, откуда пришел запрос (message или callback_query)
-    if update.message:
-        user_id = update.effective_user.id
-        send_func = update.message.reply_text
-    elif update.callback_query:
-        user_id = update.callback_query.from_user.id
-        send_func = update.callback_query.message.reply_text
+    # Если задача была из расписания, возвращаем к расписанию того же периода
+    if schedule_period:
+        # Создаем фиктивный query для обновления расписания
+        from telegram import Update as TelegramUpdate
+        fake_query = type('obj', (object,), {
+            'data': schedule_period,
+            'from_user': update.effective_user,
+            'message': update.message,
+            'answer': lambda: None,
+            'edit_message_text': lambda text, **kwargs: update.message.reply_text(text, **kwargs)
+        })()
+        fake_update = TelegramUpdate(update_id=update.update_id, callback_query=fake_query)
+        await schedule_callback(fake_update, context)
     else:
+        # Иначе отправляем обновленный список задач
+        await send_updated_task_list(update.message, str(user_id))
+    
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def refresh_schedule(query, context: ContextTypes.DEFAULT_TYPE, schedule_period: str, user_id: str):
+    """Обновление расписания после выполнения задачи"""
+    # Создаем фиктивный query для обновления расписания
+    from telegram import Update as TelegramUpdate
+    fake_query = type('obj', (object,), {
+        'data': schedule_period,
+        'from_user': query.from_user,
+        'message': query.message,
+        'answer': lambda: None,
+        'edit_message_text': lambda text, **kwargs: query.message.reply_text(text, **kwargs)
+    })()
+    fake_update = TelegramUpdate(update_id=0, callback_query=fake_query)
+    await schedule_callback(fake_update, context)
+
+
+async def send_updated_task_list(message, user_id: str):
+    """Отправка обновленного списка задач"""
+    tasks = get_user_tasks(user_id)
+    
+    if not tasks:
+        await message.reply_text("У вас пока нет задач.\nИспользуйте /add для добавления задачи.")
         return
     
-    tasks_module = context.application.bot_data.get('tasks_module')
+    text = f"<b>Ваши задачи</b> ({len(tasks)}):\n\n"
     
-    if not tasks_module:
-        await send_func(
-            "❌ Модуль задач недоступен",
-            reply_markup=get_plan_keyboard()
+    recurrence_names = {
+        'once': 'Одноразовая',
+        'daily': 'Ежедневная',
+        'weekly': 'Еженедельная'
+    }
+    
+    keyboard = []
+    
+    for i, task in enumerate(tasks, 1):
+        completed = task.get('completed', False)
+        if completed:
+            status = "✅"
+            task_title = f"<s>{task['title']}</s>"
+        else:
+            status = "⏳"
+            task_title = f"<b>{task['title']}</b>"
+        
+        text += f"{i}. {status} {task_title}\n"
+        if task.get('comment'):
+            text += f"   Комментарий: {task['comment']}\n"
+        if task.get('project'):
+            text += f"   Проект: {task['project']}\n"
+        if task.get('deadline'):
+            deadline_dt = datetime.fromisoformat(task['deadline'])
+            deadline_formatted = format_deadline_readable(deadline_dt)
+            text += f"   Дедлайн: {deadline_formatted}\n"
+        if task.get('reminder'):
+            reminder_dt = datetime.fromisoformat(task['reminder'])
+            text += f"   Напоминание: {reminder_dt.strftime('%d.%m.%Y %H:%M')}\n"
+        recurrence = task.get('recurrence', 'once')
+        text += f"   Регулярность: {recurrence_names.get(recurrence, 'Одноразовая')}\n"
+        text += "\n"
+        
+        # Добавляем кнопку для задачи (только если не выполнена)
+        if not completed:
+            task_id = task.get('id', '')
+            button_text = task['title'][:40] + "..." if len(task['title']) > 40 else task['title']
+            keyboard.append([InlineKeyboardButton(f"{i}. {button_text}", callback_data=f"task_complete_{task_id}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    await message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
+
+
+# ========== ОБРАБОТЧИКИ РЕДАКТИРОВАНИЯ ЗАДАЧ ==========
+
+async def edit_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало редактирования задачи - показываем список задач"""
+    user_id = update.effective_user.id
+    tasks = get_user_tasks(str(user_id))
+    
+    if not tasks:
+        await update.message.reply_text("У вас пока нет задач для редактирования.")
+        return ConversationHandler.END
+    
+    text = "<b>Выберите задачу для редактирования:</b>\n\n"
+    keyboard = []
+    
+    recurrence_names = {
+        'once': 'Одноразовая',
+        'daily': 'Ежедневная',
+        'weekly': 'Еженедельная'
+    }
+    
+    for i, task in enumerate(tasks, 1):
+        completed = task.get('completed', False)
+        status = "✅" if completed else "⏳"
+        task_title = task.get('title', 'Без названия')
+        
+        # Формируем краткую информацию о задаче
+        task_info = f"{i}. {status} {task_title}"
+        if task.get('deadline'):
+            deadline_dt = datetime.fromisoformat(task['deadline'])
+            deadline_formatted = format_deadline_readable(deadline_dt)
+            task_info += f" ({deadline_formatted})"
+        
+        text += f"{task_info}\n"
+        
+        # Добавляем кнопку для задачи
+        button_text = task_title[:40] + "..." if len(task_title) > 40 else task_title
+        keyboard.append([InlineKeyboardButton(f"{i}. {button_text}", callback_data=f"edit_task_{task.get('id', '')}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    msg = await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
+    await save_bot_message(msg, context)
+    
+    return WAITING_EDIT_TASK_SELECT
+
+
+async def edit_task_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора задачи для редактирования"""
+    query = update.callback_query
+    await query.answer()
+    
+    task_id = query.data.replace("edit_task_", "")
+    user_id = query.from_user.id
+    task = get_user_task_by_id(str(user_id), task_id)
+    
+    if not task:
+        await query.answer("Задача не найдена", show_alert=True)
+        return ConversationHandler.END
+    
+    # Сохраняем task_id в context
+    context.user_data['edit_task_id'] = task_id
+    
+    # Показываем меню выбора поля для редактирования
+    keyboard = [
+        [InlineKeyboardButton("Название", callback_data="edit_field_title")],
+        [InlineKeyboardButton("Комментарий", callback_data="edit_field_comment")],
+        [InlineKeyboardButton("Проект", callback_data="edit_field_project")],
+        [InlineKeyboardButton("Дедлайн", callback_data="edit_field_deadline")],
+        [InlineKeyboardButton("Напоминание", callback_data="edit_field_reminder")],
+        [InlineKeyboardButton("Регулярность", callback_data="edit_field_recurrence")],
+        [InlineKeyboardButton("🗑 Удалить задачу", callback_data="edit_field_delete")],
+        [InlineKeyboardButton("Отмена", callback_data="edit_cancel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Показываем текущую информацию о задаче
+    task_info = f"<b>Задача:</b> {task.get('title', 'Без названия')}\n\n"
+    task_info += "<b>Что хотите изменить?</b>"
+    
+    await query.edit_message_text(task_info, parse_mode='HTML', reply_markup=reply_markup)
+    
+    return WAITING_EDIT_FIELD_SELECT
+
+
+async def edit_field_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора поля для редактирования"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "edit_cancel":
+        keyboard = get_main_keyboard()
+        await query.edit_message_text("Редактирование отменено.", reply_markup=keyboard)
+        context.user_data.clear()
+        return ConversationHandler.END
+    
+    field = query.data.replace("edit_field_", "")
+    task_id = context.user_data.get('edit_task_id')
+    user_id = query.from_user.id
+    task = get_user_task_by_id(str(user_id), task_id)
+    
+    if not task:
+        await query.answer("Задача не найдена", show_alert=True)
+        return ConversationHandler.END
+    
+    context.user_data['edit_field'] = field
+    
+    if field == "title":
+        await query.edit_message_text("Введите новое название задачи:")
+        return WAITING_EDIT_TITLE
+    elif field == "comment":
+        await query.edit_message_text("Введите новый комментарий (или /skip для удаления):")
+        return WAITING_EDIT_COMMENT
+    elif field == "project":
+        # Показываем список проектов
+        projects = get_user_projects(str(user_id))
+        keyboard = []
+        for project in projects:
+            keyboard.append([InlineKeyboardButton(project, callback_data=f"edit_project_task_{project}")])
+        keyboard.append([InlineKeyboardButton("Удалить проект", callback_data="edit_project_task_remove")])
+        keyboard.append([InlineKeyboardButton("Отмена", callback_data="edit_cancel")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("Выберите проект (или удалите текущий):", reply_markup=reply_markup)
+        return WAITING_EDIT_PROJECT
+    elif field == "deadline":
+        await query.edit_message_text(
+            "Введите новый дедлайн (или /skip для удаления).\n\n"
+            "Например: завтра 18:00, вторник 14:00, 15.02.2026"
+        )
+        return WAITING_EDIT_DEADLINE
+    elif field == "reminder":
+        # Показываем кнопки для напоминания
+        keyboard = [
+            [InlineKeyboardButton("За час", callback_data="edit_reminder_1h")],
+            [InlineKeyboardButton("За 3 часа", callback_data="edit_reminder_3h")],
+            [InlineKeyboardButton("За 6 часов", callback_data="edit_reminder_6h")],
+            [InlineKeyboardButton("За день", callback_data="edit_reminder_1d")],
+            [InlineKeyboardButton("Удалить напоминание", callback_data="edit_reminder_remove")],
+            [InlineKeyboardButton("Отмена", callback_data="edit_cancel")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("Выберите напоминание:", reply_markup=reply_markup)
+        return WAITING_EDIT_REMINDER
+    elif field == "recurrence":
+        # Показываем кнопки для регулярности
+        keyboard = [
+            [InlineKeyboardButton("Одноразовая", callback_data="edit_recurrence_once")],
+            [InlineKeyboardButton("Ежедневная", callback_data="edit_recurrence_daily")],
+            [InlineKeyboardButton("Еженедельная", callback_data="edit_recurrence_weekly")],
+            [InlineKeyboardButton("Отмена", callback_data="edit_cancel")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("Выберите регулярность:", reply_markup=reply_markup)
+        return WAITING_EDIT_RECURRENCE
+    elif field == "delete":
+        # Удаление задачи
+        if delete_user_task(str(user_id), task_id):
+            keyboard = get_main_keyboard()
+            await query.edit_message_text("✅ Задача удалена.", reply_markup=keyboard)
+        else:
+            await query.answer("Не удалось удалить задачу", show_alert=True)
+        context.user_data.clear()
+        return ConversationHandler.END
+    
+    return ConversationHandler.END
+
+
+async def edit_task_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Редактирование названия задачи"""
+    task_id = context.user_data.get('edit_task_id')
+    user_id = update.effective_user.id
+    
+    text = None
+    if update.message.voice:
+        if update.message.caption:
+            text = update.message.caption.strip()
+            text = normalize_voice_text(text)
+        elif VOICE_SUPPORT:
+            try:
+                voice_file = await update.message.voice.get_file()
+                transcribed_text = await transcribe_voice(voice_file, update)
+                if transcribed_text:
+                    text = transcribed_text.strip()
+                else:
+                    await update.message.reply_text("Не удалось распознать голосовое сообщение. Попробуйте написать текстом:")
+                    return WAITING_EDIT_TITLE
+            except Exception as e:
+                print(f"Ошибка при обработке голосового сообщения: {e}")
+                await update.message.reply_text("Ошибка обработки голосового сообщения. Попробуйте написать текстом:")
+                return WAITING_EDIT_TITLE
+        else:
+            await update.message.reply_text("Повторите текстом:")
+            return WAITING_EDIT_TITLE
+    elif update.message.text:
+        text = update.message.text.strip()
+    
+    if not text:
+        await update.message.reply_text("Ошибка: Введите название задачи.")
+        return WAITING_EDIT_TITLE
+    
+    title = capitalize_first(text)
+    
+    update_user_task(str(user_id), task_id, {'title': title})
+    
+    await update.message.reply_text(f"✅ Название задачи изменено на: <b>{title}</b>", parse_mode='HTML')
+    
+    keyboard = get_main_keyboard()
+    await update.message.reply_text("Редактирование завершено.", reply_markup=keyboard)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def edit_task_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Редактирование комментария задачи"""
+    task_id = context.user_data.get('edit_task_id')
+    user_id = update.effective_user.id
+    
+    if update.message.text and update.message.text.strip() == "/skip":
+        update_user_task(str(user_id), task_id, {'comment': None})
+        await update.message.reply_text("✅ Комментарий удален.")
+    else:
+        text = None
+        if update.message.voice:
+            if update.message.caption:
+                text = update.message.caption.strip()
+                text = normalize_voice_text(text)
+            elif VOICE_SUPPORT:
+                try:
+                    voice_file = await update.message.voice.get_file()
+                    transcribed_text = await transcribe_voice(voice_file, update)
+                    if transcribed_text:
+                        text = transcribed_text.strip()
+                    else:
+                        await update.message.reply_text("Не удалось распознать голосовое сообщение. Попробуйте написать текстом:")
+                        return WAITING_EDIT_COMMENT
+                except Exception as e:
+                    print(f"Ошибка при обработке голосового сообщения: {e}")
+                    await update.message.reply_text("Ошибка обработки голосового сообщения. Попробуйте написать текстом:")
+                    return WAITING_EDIT_COMMENT
+            else:
+                await update.message.reply_text("Повторите текстом:")
+                return WAITING_EDIT_COMMENT
+        elif update.message.text:
+            text = update.message.text.strip()
+        
+        if text:
+            comment = capitalize_first(text)
+            update_user_task(str(user_id), task_id, {'comment': comment})
+            await update.message.reply_text(f"✅ Комментарий изменен на: <b>{comment}</b>", parse_mode='HTML')
+        else:
+            await update.message.reply_text("Ошибка: Введите комментарий или /skip для удаления.")
+            return WAITING_EDIT_COMMENT
+    
+    keyboard = get_main_keyboard()
+    await update.message.reply_text("Редактирование завершено.", reply_markup=keyboard)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def edit_task_project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора проекта при редактировании"""
+    query = update.callback_query
+    await query.answer()
+    
+    task_id = context.user_data.get('edit_task_id')
+    user_id = query.from_user.id
+    
+    if query.data == "edit_project_task_remove":
+        update_user_task(str(user_id), task_id, {'project': None})
+        await query.edit_message_text("✅ Проект удален из задачи.")
+    elif query.data.startswith("edit_project_task_"):
+        project_name = query.data.replace("edit_project_task_", "")
+        if project_name:  # Проверяем, что название не пустое
+            update_user_task(str(user_id), task_id, {'project': project_name})
+            await query.edit_message_text(f"✅ Проект изменен на: <b>{project_name}</b>", parse_mode='HTML')
+        else:
+            return WAITING_EDIT_PROJECT
+    elif query.data == "edit_cancel":
+        keyboard = get_main_keyboard()
+        await query.edit_message_text("Редактирование отменено.", reply_markup=keyboard)
+        context.user_data.clear()
+        return ConversationHandler.END
+    else:
+        return WAITING_EDIT_PROJECT
+    
+    keyboard = get_main_keyboard()
+    await query.message.reply_text("Редактирование завершено.", reply_markup=keyboard)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def edit_task_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Редактирование дедлайна задачи"""
+    task_id = context.user_data.get('edit_task_id')
+    user_id = update.effective_user.id
+    
+    if update.message.text and update.message.text.strip() == "/skip":
+        update_user_task(str(user_id), task_id, {'deadline': None})
+        await update.message.reply_text("✅ Дедлайн удален.")
+    else:
+        text = None
+        if update.message.voice:
+            if update.message.caption:
+                text = update.message.caption.strip()
+                text = normalize_voice_text(text)
+            elif VOICE_SUPPORT:
+                try:
+                    voice_file = await update.message.voice.get_file()
+                    transcribed_text = await transcribe_voice(voice_file, update)
+                    if transcribed_text:
+                        text = transcribed_text.strip()
+                    else:
+                        await update.message.reply_text("Не удалось распознать голосовое сообщение. Попробуйте написать текстом:")
+                        return WAITING_EDIT_DEADLINE
+                except Exception as e:
+                    print(f"Ошибка при обработке голосового сообщения: {e}")
+                    await update.message.reply_text("Ошибка обработки голосового сообщения. Попробуйте написать текстом:")
+                    return WAITING_EDIT_DEADLINE
+            else:
+                await update.message.reply_text("Повторите текстом:")
+                return WAITING_EDIT_DEADLINE
+        elif update.message.text:
+            text = update.message.text.strip()
+        
+        if not text:
+            await update.message.reply_text("Ошибка: Введите дедлайн или /skip для удаления.")
+            return WAITING_EDIT_DEADLINE
+        
+        deadline_dt = parse_deadline(text)
+        if deadline_dt is None:
+            await update.message.reply_text(
+                "Ошибка: Неверный формат даты. Попробуйте снова:\n\n"
+                "Примеры: 'завтра', '15 февраля', '15.02.2026 18:00'"
+            )
+            return WAITING_EDIT_DEADLINE
+        
+        update_user_task(str(user_id), task_id, {'deadline': deadline_dt.isoformat()})
+        deadline_formatted = format_deadline_readable(deadline_dt)
+        await update.message.reply_text(f"✅ Дедлайн изменен на: <b>{deadline_formatted}</b>", parse_mode='HTML')
+    
+    keyboard = get_main_keyboard()
+    await update.message.reply_text("Редактирование завершено.", reply_markup=keyboard)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def edit_task_reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора напоминания при редактировании"""
+    query = update.callback_query
+    await query.answer()
+    
+    task_id = context.user_data.get('edit_task_id')
+    user_id = query.from_user.id
+    task = get_user_task_by_id(str(user_id), task_id)
+    
+    if not task:
+        await query.answer("Задача не найдена", show_alert=True)
+        return ConversationHandler.END
+    
+    if query.data == "edit_reminder_remove":
+        update_user_task(str(user_id), task_id, {'reminder': None})
+        await query.edit_message_text("✅ Напоминание удалено.")
+    elif query.data == "edit_cancel":
+        keyboard = get_main_keyboard()
+        await query.edit_message_text("Редактирование отменено.", reply_markup=keyboard)
+        context.user_data.clear()
+        return ConversationHandler.END
+    else:
+        # Получаем дедлайн задачи
+        deadline_str = task.get('deadline')
+        if not deadline_str:
+            await query.answer("Сначала установите дедлайн для задачи", show_alert=True)
+            return WAITING_EDIT_REMINDER
+        
+        deadline_dt = datetime.fromisoformat(deadline_str)
+        if deadline_dt.tzinfo:
+            deadline_dt = deadline_dt.replace(tzinfo=None)
+        
+        # Вычисляем время напоминания
+        reminder_offset = query.data.replace("edit_reminder_", "")
+        if reminder_offset == "1h":
+            reminder_dt = deadline_dt - timedelta(hours=1)
+        elif reminder_offset == "3h":
+            reminder_dt = deadline_dt - timedelta(hours=3)
+        elif reminder_offset == "6h":
+            reminder_dt = deadline_dt - timedelta(hours=6)
+        elif reminder_offset == "1d":
+            reminder_dt = deadline_dt - timedelta(days=1)
+        else:
+            return WAITING_EDIT_REMINDER
+        
+        update_user_task(str(user_id), task_id, {'reminder': reminder_dt.isoformat()})
+        await query.edit_message_text(
+            f"✅ Напоминание установлено на: <b>{reminder_dt.strftime('%d.%m.%Y %H:%M')}</b>",
+            parse_mode='HTML'
+        )
+    
+    keyboard = get_main_keyboard()
+    await query.message.reply_text("Редактирование завершено.", reply_markup=keyboard)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def edit_task_recurrence_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора регулярности при редактировании"""
+    query = update.callback_query
+    await query.answer()
+    
+    task_id = context.user_data.get('edit_task_id')
+    user_id = query.from_user.id
+    
+    if query.data == "edit_cancel":
+        keyboard = get_main_keyboard()
+        await query.edit_message_text("Редактирование отменено.", reply_markup=keyboard)
+        context.user_data.clear()
+        return ConversationHandler.END
+    
+    recurrence = query.data.replace("edit_recurrence_", "")
+    recurrence_names = {
+        'once': 'Одноразовая',
+        'daily': 'Ежедневная',
+        'weekly': 'Еженедельная'
+    }
+    
+    update_user_task(str(user_id), task_id, {'recurrence': recurrence})
+    await query.edit_message_text(
+        f"✅ Регулярность изменена на: <b>{recurrence_names.get(recurrence, 'Одноразовая')}</b>",
+        parse_mode='HTML'
+    )
+    
+    keyboard = get_main_keyboard()
+    await query.message.reply_text("Редактирование завершено.", reply_markup=keyboard)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ========== ОБРАБОТЧИКИ РАСПИСАНИЯ ==========
+
+async def schedule_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню расписания с кнопками выбора периода"""
+    keyboard = [
+        [InlineKeyboardButton("Сегодня", callback_data="schedule_today")],
+        [InlineKeyboardButton("Завтра", callback_data="schedule_tomorrow")],
+        [InlineKeyboardButton("Неделя", callback_data="schedule_week")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Выберите период:", reply_markup=reply_markup)
+
+
+async def schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора периода в расписании"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    tasks = get_user_tasks(str(user_id))
+    current_time = now()
+    if current_time.tzinfo:
+        now_dt = current_time.replace(tzinfo=None)
+    else:
+        now_dt = current_time
+    
+    filtered_tasks = []
+    period_name = ""
+    
+    # Определяем начало сегодняшнего дня для фильтрации вчерашних задач
+    today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    if query.data == "schedule_today":
+        # Задачи на сегодня
+        today_end = now_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+        period_name = "сегодня"
+        
+        for task in tasks:
+            if task.get('deadline') and not task.get('completed'):
+                deadline_dt = datetime.fromisoformat(task['deadline'])
+                if deadline_dt.tzinfo:
+                    deadline_dt = deadline_dt.replace(tzinfo=None)
+                # Исключаем задачи, которые стали вчерашними (дедлайн до начала сегодняшнего дня)
+                if deadline_dt >= today_start and today_start <= deadline_dt <= today_end:
+                    filtered_tasks.append(task)
+    
+    elif query.data == "schedule_tomorrow":
+        # Задачи на завтра
+        tomorrow_start = (now_dt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow_end = (now_dt + timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=999999)
+        period_name = "завтра"
+        
+        for task in tasks:
+            if task.get('deadline') and not task.get('completed'):
+                deadline_dt = datetime.fromisoformat(task['deadline'])
+                if deadline_dt.tzinfo:
+                    deadline_dt = deadline_dt.replace(tzinfo=None)
+                # Исключаем задачи, которые стали вчерашними (дедлайн до начала сегодняшнего дня)
+                if deadline_dt >= today_start and tomorrow_start <= deadline_dt <= tomorrow_end:
+                    filtered_tasks.append(task)
+    
+    elif query.data == "schedule_week":
+        # Задачи на неделю (7 дней вперед)
+        week_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_end = (now_dt + timedelta(days=7)).replace(hour=23, minute=59, second=59, microsecond=999999)
+        period_name = "неделю"
+        
+        for task in tasks:
+            if task.get('deadline') and not task.get('completed'):
+                deadline_dt = datetime.fromisoformat(task['deadline'])
+                if deadline_dt.tzinfo:
+                    deadline_dt = deadline_dt.replace(tzinfo=None)
+                # Исключаем задачи, которые стали вчерашними (дедлайн до начала сегодняшнего дня)
+                if deadline_dt >= today_start and week_start <= deadline_dt <= week_end:
+                    filtered_tasks.append(task)
+    
+    # Сортируем задачи по дедлайну (от раннего к позднему)
+    filtered_tasks.sort(key=lambda t: datetime.fromisoformat(t['deadline']) if t.get('deadline') else datetime.max)
+    
+    # Формируем сообщение
+    if not filtered_tasks:
+        text = f"<b>Задачи на {period_name}</b>\n\n"
+        text += "Задач не найдено."
+    else:
+        # Определяем дату для заголовка (для дня) - используем полный формат
+        if query.data == "schedule_today":
+            date_header_full = format_date_full(now_dt)
+            date_header_key = format_date_readable(now_dt)
+        elif query.data == "schedule_tomorrow":
+            tomorrow_dt = now_dt + timedelta(days=1)
+            date_header_full = format_date_full(tomorrow_dt)
+            date_header_key = format_date_readable(tomorrow_dt)
+        else:
+            date_header_full = None
+            date_header_key = None  # Для недели не нужен общий заголовок
+        
+        # Разделяем задачи на те, что с временем и без времени, группируем по датам
+        tasks_by_date = {}  # date_key -> {'with_time': [(deadline_dt, task), ...], 'without_time': [task, ...]}
+        
+        current_time = now()
+        if current_time.tzinfo:
+            current_time = current_time.replace(tzinfo=None)
+        
+        for task in filtered_tasks:
+            if task.get('deadline'):
+                deadline_dt = datetime.fromisoformat(task['deadline'])
+                if deadline_dt.tzinfo:
+                    deadline_dt = deadline_dt.replace(tzinfo=None)
+                
+                # Получаем дату задачи
+                date_key = format_date_readable(deadline_dt)
+                
+                if date_key not in tasks_by_date:
+                    tasks_by_date[date_key] = {'with_time': [], 'without_time': []}
+                
+                # Проверяем, есть ли конкретное время (не конец дня)
+                if deadline_dt.hour != 23 or deadline_dt.minute != 59:
+                    tasks_by_date[date_key]['with_time'].append((deadline_dt, task))
+                else:
+                    tasks_by_date[date_key]['without_time'].append(task)
+        
+        # Формируем текст
+        if query.data == "schedule_week":
+            # Для недели группируем по датам
+            text = f"<b>Расписание на неделю</b> ({len(filtered_tasks)} задач):\n\n"
+            
+            # Создаем словарь для отображения дат в полном формате
+            date_display_map = {}  # date_key -> date_full_format
+            for task in filtered_tasks:
+                if task.get('deadline'):
+                    deadline_dt = datetime.fromisoformat(task['deadline'])
+                    if deadline_dt.tzinfo:
+                        deadline_dt = deadline_dt.replace(tzinfo=None)
+                    date_key = format_date_readable(deadline_dt)
+                    if date_key not in date_display_map:
+                        date_display_map[date_key] = format_date_full(deadline_dt)
+            
+            # Сортируем даты в правильном порядке (по datetime дедлайна первой задачи)
+            def get_date_sort_key(date_key):
+                # Находим первую задачу с этой датой для сортировки
+                for task in filtered_tasks:
+                    if task.get('deadline'):
+                        deadline_dt = datetime.fromisoformat(task['deadline'])
+                        if deadline_dt.tzinfo:
+                            deadline_dt = deadline_dt.replace(tzinfo=None)
+                        if format_date_readable(deadline_dt) == date_key:
+                            return deadline_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                return datetime.max
+            
+            date_order = sorted(tasks_by_date.keys(), key=get_date_sort_key)
+            
+            for date_key in date_order:
+                date_tasks = tasks_by_date[date_key]
+                # Используем полный формат даты для отображения
+                date_display = date_display_map.get(date_key, date_key)
+                text += f"<b>{date_display}</b>\n\n"
+                
+                # Выводим задачи с временем
+                date_tasks['with_time'].sort(key=lambda x: x[0])  # Сортируем по времени
+                for deadline_dt, task in date_tasks['with_time']:
+                    time_str = deadline_dt.strftime('%H:%M')
+                    text += f"<u>{time_str}</u>\n"
+                    text += f"<b>{task['title']}</b>\n\n"
+                
+                # Выводим задачи без времени
+                if date_tasks['without_time']:
+                    text += "дедлайн:\n"
+                    for i, task in enumerate(date_tasks['without_time'], 1):
+                        text += f"{i}. <b>{task['title']}</b>\n"
+                    text += "\n"
+        else:
+            # Для дня (сегодня/завтра) показываем дату один раз в полном формате
+            text = f"<b>{date_header_full}</b>\n\n"
+            
+            # Получаем задачи для этой даты (должна быть только одна дата)
+            date_tasks = tasks_by_date.get(date_header_key, {'with_time': [], 'without_time': []})
+            
+            # Выводим задачи с временем
+            date_tasks['with_time'].sort(key=lambda x: x[0])  # Сортируем по времени
+            for deadline_dt, task in date_tasks['with_time']:
+                time_str = deadline_dt.strftime('%H:%M')
+                text += f"<u>{time_str}</u>\n"
+                text += f"<b>{task['title']}</b>\n\n"
+            
+            # Выводим задачи без времени
+            if date_tasks['without_time']:
+                text += "дедлайн:\n"
+                for i, task in enumerate(date_tasks['without_time'], 1):
+                    text += f"{i}. <b>{task['title']}</b>\n"
+                    text += "\n"
+        
+        # Создаем кнопки для каждой задачи
+        keyboard = []
+        for task in filtered_tasks:
+            if not task.get('completed'):
+                task_id = task.get('id', '')
+                task_title = task.get('title', '')
+                button_text = task_title[:40] + "..." if len(task_title) > 40 else task_title
+                keyboard.append([InlineKeyboardButton(button_text, callback_data=f"task_complete_{task_id}")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        
+        # Сохраняем период расписания в context для последующего использования
+        context.user_data['current_schedule_period'] = query.data
+        
+        await query.edit_message_text(text, parse_mode='HTML', reply_markup=reply_markup)
+
+
+# ========== ОБРАБОТЧИКИ ДОБАВЛЕНИЯ ПРОЕКТОВ ==========
+
+async def add_project_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало добавления проекта из callback (кнопки)"""
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    await query.edit_message_text(
+        "<b>Добавление проекта</b>\n\n"
+        "Введите название проекта:",
+        parse_mode='HTML'
+    )
+    return WAITING_PROJECT_NAME
+
+
+async def add_project_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало добавления проекта"""
+    context.user_data.clear()
+    await update.message.reply_text(
+        "<b>Добавление проекта</b>\n\n"
+        "Введите название проекта:",
+        parse_mode='HTML'
+    )
+    return WAITING_PROJECT_NAME
+
+
+async def add_project_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение названия проекта"""
+    project_name = update.message.text.strip()
+    
+    if not project_name:
+        await update.message.reply_text("Ошибка: Название проекта не может быть пустым. Попробуйте снова:")
+        return WAITING_PROJECT_NAME
+    
+    user_id = update.effective_user.id
+    projects = get_user_projects(str(user_id))
+    
+    # Проверяем на дубликаты
+    if project_name in projects:
+        await update.message.reply_text(
+            f"Проект <b>{project_name}</b> уже существует. Введите другое название:",
+            parse_mode='HTML'
+        )
+        return WAITING_PROJECT_NAME
+    
+    context.user_data['project_name'] = project_name
+    
+    # Показываем кнопки для выбора типа проекта
+    keyboard = [
+        [InlineKeyboardButton("Программное", callback_data="project_type_software")],
+        [InlineKeyboardButton("Проектное", callback_data="project_type_project")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        f"Проект <b>{project_name}</b>\n\n"
+        "Выберите тип проекта:",
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+    return WAITING_PROJECT_TYPE
+
+
+async def add_project_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора типа проекта через кнопки"""
+    query = update.callback_query
+    await query.answer()
+    
+    project_type = None
+    if query.data == "project_type_software":
+        project_type = "software"
+        type_name = "Программное"
+    elif query.data == "project_type_project":
+        project_type = "project"
+        type_name = "Проектное"
+    
+    context.user_data['project_type'] = project_type
+    
+    project_name = context.user_data.get('project_name')
+    
+    # Если проектный, спрашиваем количество шагов
+    if project_type == "project":
+        try:
+            await query.edit_message_text(
+                f"Проект <b>{project_name}</b>\n"
+                f"Тип: {type_name}\n\n"
+                "Сколько шагов (задач) предположительно предстоит предпринять?",
+                parse_mode='HTML'
+            )
+        except:
+            await query.message.reply_text(
+                f"Проект <b>{project_name}</b>\n"
+                f"Тип: {type_name}\n\n"
+                "Сколько шагов (задач) предположительно предстоит предпринять?",
+                parse_mode='HTML'
+            )
+        return WAITING_PROJECT_TARGET_TASKS
+    else:
+        # Для программного сразу завершаем создание проекта
+        user_id = query.from_user.id
+        add_user_project(str(user_id), project_name, None, project_type, None)
+        
+        text_msg = f"✅ Проект <b>{project_name}</b> успешно добавлен!\n"
+        text_msg += f"Тип: {type_name}"
+        
+        keyboard = get_main_keyboard()
+        try:
+            await query.edit_message_text(text_msg, parse_mode='HTML')
+            await query.message.reply_text("Готово!", reply_markup=keyboard)
+        except:
+            await query.message.reply_text(text_msg, parse_mode='HTML', reply_markup=keyboard)
+        
+        context.user_data.clear()
+        return ConversationHandler.END
+
+
+async def add_project_target_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение количества шагов для проектного проекта"""
+    text = update.message.text.strip()
+    project_name = context.user_data.get('project_name')
+    
+    try:
+        target_tasks = int(text)
+        if target_tasks <= 0:
+            await update.message.reply_text(
+                "Ошибка: Количество шагов должно быть положительным числом. Попробуйте снова:"
+            )
+            return WAITING_PROJECT_TARGET_TASKS
+    except ValueError:
+        await update.message.reply_text(
+            "Ошибка: Введите число. Попробуйте снова:"
+        )
+        return WAITING_PROJECT_TARGET_TASKS
+    
+    context.user_data['target_tasks'] = target_tasks
+    
+    # После ввода количества шагов спрашиваем приоритет
+    keyboard = [
+        [InlineKeyboardButton("Приоритет 1", callback_data="project_priority_1")],
+        [InlineKeyboardButton("Приоритет 2", callback_data="project_priority_2")],
+        [InlineKeyboardButton("Приоритет 3", callback_data="project_priority_3")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"Проект <b>{project_name}</b>\n"
+        f"Запланировано шагов: {target_tasks}\n\n"
+        "Выберите приоритет проекта:",
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+    
+    return WAITING_PROJECT_PRIORITY
+
+
+async def add_project_priority_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора приоритета проекта через кнопки"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Извлекаем приоритет из callback_data
+    priority_str = query.data.replace("project_priority_", "")
+    try:
+        priority = int(priority_str)
+        if priority not in [1, 2, 3]:
+            await query.edit_message_text("Ошибка: Неверный приоритет. Попробуйте снова.")
+            return WAITING_PROJECT_PRIORITY
+    except ValueError:
+        await query.edit_message_text("Ошибка: Неверный формат приоритета. Попробуйте снова.")
+        return WAITING_PROJECT_PRIORITY
+    
+    context.user_data['priority'] = priority
+    
+    # После выбора приоритета спрашиваем дату окончания проекта
+    project_name = context.user_data.get('project_name')
+    
+    keyboard = [
+        [InlineKeyboardButton("Пропустить", callback_data="project_end_date_skip")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.edit_message_text(
+            f"Проект <b>{project_name}</b>\n"
+            f"Приоритет: {priority}\n\n"
+            "Введите дату окончания проекта (или нажмите 'Пропустить'):\n\n"
+            "Примеры:\n"
+            "• завтра\n"
+            "• 15 февраля\n"
+            "• 25.02.2026\n"
+            "• через неделю",
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+    except:
+        await query.message.reply_text(
+            f"Проект <b>{project_name}</b>\n"
+            f"Приоритет: {priority}\n\n"
+            "Введите дату окончания проекта (или нажмите 'Пропустить'):\n\n"
+            "Примеры:\n"
+            "• завтра\n"
+            "• 15 февраля\n"
+            "• 25.02.2026\n"
+            "• через неделю",
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+    
+    return WAITING_PROJECT_END_DATE
+
+
+async def add_project_end_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка ввода даты окончания проекта"""
+    # Проверяем, это callback (пропустить) или сообщение с датой
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "project_end_date_skip":
+            # Пропускаем дату окончания
+            end_date = None
+        else:
+            return WAITING_PROJECT_END_DATE
+    else:
+        # Парсим дату из текста
+        text = update.message.text.strip()
+        
+        if text.lower() in ['пропустить', 'skip', '/skip']:
+            end_date = None
+        else:
+            # Используем parse_deadline для парсинга даты
+            deadline_dt = parse_deadline(text)
+            
+            if deadline_dt is None:
+                await update.message.reply_text(
+                    "Не удалось распознать дату. Попробуйте снова или напишите 'пропустить':\n\n"
+                    "Примеры:\n"
+                    "• завтра\n"
+                    "• 15 февраля\n"
+                    "• 25.02.2026"
+                )
+                return WAITING_PROJECT_END_DATE
+            
+            # Сохраняем дату в формате YYYY-MM-DD
+            end_date = deadline_dt.strftime('%Y-%m-%d')
+    
+    context.user_data['end_date'] = end_date
+    
+    # Завершаем создание проекта
+    project_name = context.user_data.get('project_name')
+    project_type = context.user_data.get('project_type', 'project')
+    target_tasks = context.user_data.get('target_tasks')
+    priority = context.user_data.get('priority')
+    user_id = update.effective_user.id if update.message else update.callback_query.from_user.id
+    
+    add_user_project(str(user_id), project_name, None, project_type, target_tasks, priority, end_date)
+    
+    # Форматируем дату для отображения
+    if end_date:
+        try:
+            end_date_dt = datetime.strptime(end_date, '%Y-%m-%d')
+            end_date_formatted = end_date_dt.strftime('%d.%m.%Y')
+        except:
+            end_date_formatted = end_date
+    else:
+        end_date_formatted = None
+    
+    text_msg = f"✅ Проект <b>{project_name}</b> успешно добавлен!\n"
+    text_msg += f"Тип: Проектное\n"
+    text_msg += f"Запланировано шагов: {target_tasks}\n"
+    text_msg += f"Приоритет: {priority}"
+    if end_date_formatted:
+        text_msg += f"\nДата окончания: {end_date_formatted}"
+    
+    keyboard = get_main_keyboard()
+    
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(text_msg, parse_mode='HTML')
+            await update.callback_query.message.reply_text("Готово!", reply_markup=keyboard)
+        except:
+            await update.callback_query.message.reply_text(text_msg, parse_mode='HTML', reply_markup=keyboard)
+    else:
+        await update.message.reply_text(text_msg, parse_mode='HTML', reply_markup=keyboard)
+    
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def add_project_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение категории проекта"""
+    text = update.message.text.strip()
+    project_name = context.user_data.get('project_name')
+    project_type = context.user_data.get('project_type', 'software')
+    target_tasks = context.user_data.get('target_tasks')
+    user_id = update.effective_user.id
+    
+    if not text or text.lower() == '/skip' or text.lower() == 'skip':
+        category = None
+    else:
+        category = text
+    
+    # Сохраняем проект
+    add_user_project(str(user_id), project_name, category, project_type, target_tasks)
+    
+    type_name = "Программное" if project_type == "software" else "Проектное"
+    text_msg = f"✅ Проект <b>{project_name}</b> успешно добавлен!\n"
+    text_msg += f"Тип: {type_name}"
+    if target_tasks:
+        text_msg += f"\nЗапланировано шагов: {target_tasks}"
+    if category:
+        text_msg += f"\nКатегория: {category}"
+    
+    keyboard = get_main_keyboard()
+    await update.message.reply_text(text_msg, parse_mode='HTML', reply_markup=keyboard)
+    
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ========== ОБРАБОТЧИКИ РАЗДЕЛА ПРОЕКТЫ ==========
+
+async def projects_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать список проектов как кнопки"""
+    try:
+        user_id = update.effective_user.id
+        projects = get_user_projects(str(user_id))
+        
+        if not projects:
+            keyboard = [
+                [InlineKeyboardButton("Добавить...", callback_data="add_project")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                "У вас пока нет проектов.",
+                reply_markup=reply_markup
+            )
+            return
+        
+        # Создаем кнопки для проектов
+        keyboard = []
+        for project in projects:
+            if project:  # Проверяем, что название проекта не пустое
+                # Telegram ограничивает callback_data до 64 байт
+                # "project_info_" = 13 символов, оставляем ~50 байт для названия
+                prefix = "project_info_"
+                max_project_bytes = 64 - len(prefix.encode('utf-8')) - 1  # -1 для безопасности
+                
+                project_bytes = project.encode('utf-8')
+                if len(project_bytes) > max_project_bytes:
+                    # Если название слишком длинное, обрезаем его по байтам
+                    truncated_bytes = project_bytes[:max_project_bytes]
+                    # Убираем неполные символы в конце
+                    try:
+                        project_callback = truncated_bytes.decode('utf-8')
+                    except UnicodeDecodeError:
+                        # Если последний байт неполный, убираем его
+                        project_callback = truncated_bytes[:-1].decode('utf-8', errors='ignore')
+                else:
+                    project_callback = project
+                
+                callback_data = f"{prefix}{project_callback}"
+                keyboard.append([InlineKeyboardButton(project, callback_data=callback_data)])
+        
+        # Добавляем кнопки "Редактировать" и "Добавить..."
+        keyboard.append([InlineKeyboardButton("Редактировать", callback_data="edit_projects_list")])
+        keyboard.append([InlineKeyboardButton("Добавить...", callback_data="add_project")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"<b>Проекты</b> ({len(projects)}):",
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        print(f"Ошибка в projects_list: {e}")
+        import traceback
+        traceback.print_exc()
+        await update.message.reply_text("Произошла ошибка при загрузке проектов.")
+
+
+async def project_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатия на проект"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "projects_list":
+        await projects_list_callback(update, context)
+        return
+    
+    if query.data == "projects_summary":
+        await show_projects_summary(query, context)
+        return
+    
+    # Обработка кнопки "Редактировать" в списке проектов
+    if query.data == "edit_projects_list":
+        await edit_projects_list_start(query, context)
+        return
+    
+    # Извлекаем название проекта из callback_data
+    if query.data.startswith("project_info_"):
+        project_name = query.data.replace("project_info_", "")
+        await show_project_info(query, context, project_name)
+        return
+    
+    # Обработка кнопки "Задачи по проекту"
+    if query.data.startswith("project_tasks_"):
+        project_name = query.data.replace("project_tasks_", "")
+        await show_project_tasks(query, context, project_name)
+        return
+    
+    # Обработка кнопки "Редактировать название проекта"
+    if query.data.startswith("edit_project_name_"):
+        # Обрабатывается через ConversationHandler
+        return
+    
+    # Обработка кнопки "Редактировать проект" и "Проект готов?" 
+    # обрабатываются через ConversationHandler
+
+
+async def show_projects_summary_from_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать статистику проектов из главного меню"""
+    # Завершаем любые активные ConversationHandler
+    if context.user_data.get('edit_project_name') or context.user_data.get('edit_project_name_old'):
+        context.user_data.clear()
+    
+    user_id = update.effective_user.id
+    data = load_data()
+    projects_data = data.get('users', {}).get(str(user_id), {}).get('projects_data', {})
+    all_tasks = get_user_tasks(str(user_id))
+    
+    if not projects_data:
+        await update.message.reply_text("У вас пока нет проектов.")
+        return
+    
+    # Разделяем проекты на программные и проектные, активные и завершенные
+    software_projects = []
+    project_projects = []
+    completed_projects = []
+    
+    for project_name, project_data in projects_data.items():
+        project_type = project_data.get('type', 'software')
+        is_completed = project_data.get('completed', False)
+        
+        if is_completed:
+            completed_projects.append((project_name, project_data))
+        elif project_type == 'software':
+            software_projects.append((project_name, project_data))
+        else:
+            project_projects.append((project_name, project_data))
+    
+    text = "<b>Статистика</b>\n\n"
+    
+    # Программные проекты
+    if software_projects:
+        text += "<b>Программные:</b>\n"
+        current_time = now()
+        if current_time.tzinfo:
+            current_time = current_time.replace(tzinfo=None)
+        
+        for project_name, project_data in software_projects:
+            project_tasks = [task for task in all_tasks if task.get('project') == project_name]
+            
+            # Сортируем задачи по дате создания (новые первые)
+            sorted_tasks = sorted(project_tasks, key=lambda t: t.get('created_at', ''), reverse=True)
+            # Берем последние 10 задач для прогресс-бара
+            recent_tasks = sorted_tasks[:10]
+            
+            # Формируем прогресс-бар из эмодзи статусов
+            progress_bar = ""
+            for task in recent_tasks:
+                completed = task.get('completed', False)
+                
+                if completed:
+                    # Выполнено - зеленый
+                    progress_bar += "🟢"
+                # Невыполненные задачи не показываем в прогресс-баре
+            
+            if not progress_bar:
+                progress_bar = "Нет выполненных задач"
+            
+            text += f"{project_name}: {progress_bar}\n"
+        text += "\n"
+    else:
+        text += "<b>Программные:</b>\nНет программных проектов\n\n"
+    
+    # Проектные проекты
+    if project_projects:
+        text += "<b>Проектные:</b>\n"
+        for project_name, project_data in project_projects:
+            project_tasks = [task for task in all_tasks if task.get('project') == project_name]
+            completed_tasks = sum(1 for task in project_tasks if task.get('completed', False))
+            target_tasks = project_data.get('target_tasks')
+            
+            if target_tasks is not None and target_tasks > 0:
+                progress = min(completed_tasks / target_tasks * 100, 100)
+            else:
+                total_tasks = len(project_tasks)
+                if total_tasks > 0:
+                    progress = min(completed_tasks / total_tasks * 100, 100)
+                else:
+                    progress = 0
+            
+            bar_length = 20
+            filled = int(progress / 100 * bar_length)
+            bar = "█" * filled + "░" * (bar_length - filled)
+            text += f"{project_name}:\n{bar} {progress:.0f}%\n"
+    else:
+        text += "<b>Проектные:</b>\nНет проектных проектов\n"
+    
+    # Завершенные проекты
+    if completed_projects:
+        text += "\n<b>Завершенные проекты:</b>\n"
+        # Сортируем завершенные проекты по дате окончания (если есть), затем по названию
+        from datetime import datetime as _dt
+
+        def _completed_sort_key(item):
+            name, pdata = item
+            end_date = pdata.get('end_date')
+            if end_date:
+                try:
+                    dt = _dt.strptime(end_date, '%Y-%m-%d')
+                except Exception:
+                    dt = _dt.max
+            else:
+                dt = _dt.max
+            return (dt, name.lower())
+
+        for project_name, project_data in sorted(completed_projects, key=_completed_sort_key):
+            text += f"<s>{project_name}</s>\n"
+    
+    await update.message.reply_text(text, parse_mode='HTML')
+
+
+async def show_projects_summary(query, context: ContextTypes.DEFAULT_TYPE):
+    """Показать сводную информацию по всем проектам"""
+    user_id = query.from_user.id
+    data = load_data()
+    projects_data = data.get('users', {}).get(str(user_id), {}).get('projects_data', {})
+    all_tasks = get_user_tasks(str(user_id))
+    
+    # Разделяем проекты на проектные и программные, активные и завершенные
+    project_projects = []
+    software_projects = []
+    completed_projects = []
+    
+    for project_name, project_data in projects_data.items():
+        project_type = project_data.get('type', 'software')
+        is_completed = project_data.get('completed', False)
+        
+        if is_completed:
+            completed_projects.append((project_name, project_data))
+        elif project_type == 'project':
+            project_projects.append((project_name, project_data))
+        else:
+            software_projects.append((project_name, project_data))
+    
+    text = "<b>Статистика</b>\n\n"
+    
+    # Проектные проекты - сортируем по приоритету (1, 2, 3), затем по названию
+    if project_projects:
+        # Сортируем проекты: сначала по приоритету (1 - самый высокий), затем по названию
+        def sort_key(item):
+            project_name, project_data = item
+            priority = project_data.get('priority', 3)  # По умолчанию приоритет 3 (низкий)
+            return (priority, project_name.lower())
+        
+        sorted_project_projects = sorted(project_projects, key=sort_key)
+        
+        text += "<b>Проектные:</b>\n\n"
+        for project_name, project_data in sorted_project_projects:
+            project_tasks = [task for task in all_tasks if task.get('project') == project_name]
+            completed_tasks = sum(1 for task in project_tasks if task.get('completed', False))
+            target_tasks = project_data.get('target_tasks')
+            priority = project_data.get('priority', 3)
+            end_date = project_data.get('end_date')
+            
+            if target_tasks is not None and target_tasks > 0:
+                progress = min(completed_tasks / target_tasks * 100, 100)
+            else:
+                total_tasks = len(project_tasks)
+                if total_tasks > 0:
+                    progress = min(completed_tasks / total_tasks * 100, 100)
+                else:
+                    progress = 0
+            
+            # Прогресс бар (20 символов)
+            bar_length = 20
+            filled = int(progress / 100 * bar_length)
+            bar = "█" * filled + "░" * (bar_length - filled)
+            
+            # Формируем строку с информацией о проекте
+            project_info = f"{project_name} [Приоритет {priority}]"
+            if end_date:
+                try:
+                    end_date_dt = datetime.strptime(end_date, '%Y-%m-%d')
+                    end_date_formatted = end_date_dt.strftime('%d.%m.%Y')
+                    project_info += f"\n📅 До {end_date_formatted}"
+                except:
+                    project_info += f"\n📅 До {end_date}"
+            
+            text += f"{project_info}:\n{bar} {progress:.0f}%\n\n"
+    else:
+        text += "<b>Проектные:</b>\nНет проектных проектов\n\n"
+    
+    # Программные проекты
+    if software_projects:
+        text += "<b>Программные:</b>\n\n"
+        current_time = now()
+        if current_time.tzinfo:
+            current_time = current_time.replace(tzinfo=None)
+        
+        for project_name, project_data in software_projects:
+            project_tasks = [task for task in all_tasks if task.get('project') == project_name]
+            
+            # Сортируем задачи по дате создания (новые первые)
+            sorted_tasks = sorted(project_tasks, key=lambda t: t.get('created_at', ''), reverse=True)
+            # Берем последние 10 задач для прогресс-бара
+            recent_tasks = sorted_tasks[:10]
+            
+            # Формируем прогресс-бар из эмодзи статусов
+            progress_bar = ""
+            for task in recent_tasks:
+                completed = task.get('completed', False)
+                
+                if completed:
+                    # Выполнено - зеленый
+                    progress_bar += "🟢"
+                # Невыполненные задачи не показываем в прогресс-баре
+            
+            if not progress_bar:
+                progress_bar = "Нет выполненных задач"
+            
+            text += f"{project_name}\n{progress_bar}\n\n"
+    else:
+        text += "<b>Программные:</b>\nНет программных проектов\n\n"
+    
+    # Выполненные проекты
+    if completed_projects:
+        text += "<b>Завершенные проекты:</b>\n"
+        # Сортируем завершенные проекты по дате окончания (если есть), затем по названию
+        from datetime import datetime as _dt
+
+        def _completed_sort_key(item):
+            name, pdata = item
+            end_date = pdata.get('end_date')
+            if end_date:
+                try:
+                    dt = _dt.strptime(end_date, '%Y-%m-%d')
+                except Exception:
+                    dt = _dt.max
+            else:
+                dt = _dt.max
+            return (dt, name.lower())
+
+        for project_name, project_data in sorted(completed_projects, key=_completed_sort_key):
+            text += f"<s>{project_name}</s>\n"
+        text += "\n"
+    
+    # Кнопка "Назад"
+    keyboard = [
+        [InlineKeyboardButton("← Назад", callback_data="projects_list")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(text, parse_mode='HTML', reply_markup=reply_markup)
+
+
+async def show_project_info(query, context: ContextTypes.DEFAULT_TYPE, project_name: str):
+    """Показать информацию о проекте"""
+    user_id = query.from_user.id
+    data = load_data()
+    projects_data = data.get('users', {}).get(str(user_id), {}).get('projects_data', {})
+    project_data = projects_data.get(project_name, {})
+    
+    # Получаем тип проекта
+    project_type = project_data.get('type', 'software')
+    type_name = "Программное" if project_type == "software" else "Проектное"
+    
+    # Получаем задачи проекта
+    all_tasks = get_user_tasks(str(user_id))
+    project_tasks = [task for task in all_tasks if task.get('project') == project_name]
+    
+    # Формируем текст в новом формате
+    text = f"<b>{project_name}</b>\n"
+    text += f"<i>{type_name}</i>\n"
+    
+    # Добавляем информацию о приоритете и дате окончания для проектных проектов
+    if project_type == "project":
+        priority = project_data.get('priority')
+        end_date = project_data.get('end_date')
+        
+        if priority:
+            text += f"Приоритет: {priority}\n"
+        
+        if end_date:
+            try:
+                end_date_dt = datetime.strptime(end_date, '%Y-%m-%d')
+                end_date_formatted = end_date_dt.strftime('%d.%m.%Y')
+                text += f"📅 Дата окончания: {end_date_formatted}\n"
+            except:
+                text += f"📅 Дата окончания: {end_date}\n"
+    
+    text += "\n"
+    
+    # Вычисляем прогресс
+    completed_tasks = sum(1 for task in project_tasks if task.get('completed', False))
+    
+    if project_type == "software":
+        # Программное: прогресс-бар из статусов последних задач
+        # Сортируем задачи по дате создания (новые первые)
+        sorted_tasks = sorted(project_tasks, key=lambda t: t.get('created_at', ''), reverse=True)
+        # Берем последние 10 задач для прогресс-бара
+        recent_tasks = sorted_tasks[:10]
+        
+        current_time = now()
+        if current_time.tzinfo:
+            current_time = current_time.replace(tzinfo=None)
+        
+        # Формируем прогресс-бар из эмодзи статусов
+        progress_bar = ""
+        for task in recent_tasks:
+            completed = task.get('completed', False)
+            
+            if completed:
+                # Выполнено - зеленый
+                progress_bar += "🟢"
+            # Невыполненные задачи не показываем в прогресс-баре
+        
+        # Если задач нет, показываем сообщение
+        if not progress_bar:
+            progress_bar = "Нет выполненных задач"
+        
+        text += f"{progress_bar}\n"
+    else:
+        # Проектное: прогресс по выполненным/запланированным шагам
+        target_tasks = project_data.get('target_tasks')
+        if target_tasks is not None and target_tasks > 0:
+            progress = min(completed_tasks / target_tasks * 100, 100)
+            text += f"Прогресс: {completed_tasks}/{target_tasks} задач\n"
+        else:
+            # Если target_tasks не задан, используем общее количество задач
+            total_tasks = len(project_tasks)
+            if total_tasks > 0:
+                progress = min(completed_tasks / total_tasks * 100, 100)
+                text += f"Прогресс: {completed_tasks}/{total_tasks} задач\n"
+            else:
+                progress = 0
+                text += f"Прогресс: 0/0 задач\n"
+        
+        # Прогресс бар (20 символов)
+        bar_length = 20
+        filled = int(progress / 100 * bar_length)
+        bar = "█" * filled + "░" * (bar_length - filled)
+        text += f"{bar} {progress:.0f}%\n"
+    
+    # Кнопки для проектного проекта
+    keyboard = []
+    if project_type == "project":
+        keyboard.append([InlineKeyboardButton("Задачи по проекту", callback_data=f"project_tasks_{project_name}")])
+        keyboard.append([InlineKeyboardButton("Редактировать проект", callback_data=f"edit_project_{project_name}")])
+        keyboard.append([InlineKeyboardButton("Проект готов?", callback_data=f"project_complete_{project_name}")])
+    else:
+        keyboard.append([InlineKeyboardButton("Задачи по проекту", callback_data=f"project_tasks_{project_name}")])
+    
+    keyboard.append([InlineKeyboardButton("← Назад", callback_data="projects_list")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(text, parse_mode='HTML', reply_markup=reply_markup)
+
+
+async def show_project_tasks(query, context: ContextTypes.DEFAULT_TYPE, project_name: str):
+    """Показать задачи проекта с кнопками"""
+    user_id = query.from_user.id
+    all_tasks = get_user_tasks(str(user_id))
+    project_tasks = [task for task in all_tasks if task.get('project') == project_name]
+    
+    if not project_tasks:
+        keyboard = [
+            [InlineKeyboardButton("← Назад к проекту", callback_data=f"project_info_{project_name}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            f'<b>Задачи проекта "{project_name}"</b>\n\nЗадач не найдено.',
+            parse_mode='HTML',
+            reply_markup=reply_markup
         )
         return
     
-    try:
-        # Получаем все задачи пользователя
-        if hasattr(tasks_module, 'get_user_tasks'):
-            tasks = tasks_module.get_user_tasks(str(user_id))
+    text = f'<b>Задачи проекта "{project_name}"</b> ({len(project_tasks)}):\n\n'
+    
+    recurrence_names = {
+        'once': 'Одноразовая',
+        'daily': 'Ежедневная',
+        'weekly': 'Еженедельная'
+    }
+    
+    keyboard = []
+    
+    # Сортируем задачи по дедлайну (если есть)
+    def get_task_sort_key(task):
+        if task.get('deadline'):
+            deadline_dt = datetime.fromisoformat(task['deadline'])
+            if deadline_dt.tzinfo:
+                deadline_dt = deadline_dt.replace(tzinfo=None)
+            return deadline_dt
+        return datetime.max
+    
+    sorted_tasks = sorted(project_tasks, key=get_task_sort_key)
+    
+    for i, task in enumerate(sorted_tasks, 1):
+        completed = task.get('completed', False)
+        
+        # Формируем дату дедлайна (жирным) с днем недели
+        if task.get('deadline'):
+            deadline_dt = datetime.fromisoformat(task['deadline'])
+            if deadline_dt.tzinfo:
+                deadline_dt = deadline_dt.replace(tzinfo=None)
+            deadline_formatted = format_date_full(deadline_dt)
+            text += f"<b>{deadline_formatted}</b>\n"
         else:
-            await send_func(
-                "❌ Не удалось получить задачи",
-                reply_markup=get_plan_keyboard()
-            )
-            return
+            text += "<b>Без дедлайна</b>\n"
         
-        if not tasks:
-            await send_func(
-                "📝 У вас пока нет задач.\n\nДобавьте задачи в разделе «Задачи».",
-                reply_markup=get_plan_keyboard()
-            )
-            return
+        # Название задачи (подчеркнуто)
+        if completed:
+            task_title = f"<s><u>{task['title']}</u></s>"
+        else:
+            task_title = f"<u>{task['title']}</u>"
+        text += f"{task_title}\n"
         
-        # Формируем список задач с кнопками для отметки
-        text = "<b>✅ Управление задачами</b>\n\n"
-        text += "Нажмите на задачу: выполнить, редактировать (название или время) или вернуться.\n\n"
+        # Комментарий (курсивом, с новой строки)
+        if task.get('comment'):
+            text += f"<i>{task['comment']}</i>\n"
         
-        keyboard = []
+        text += "\n"
         
-        # Показываем только невыполненные задачи
-        incomplete_tasks = [t for t in tasks if not t.get('completed', False)]
-        
-        for i, task in enumerate(incomplete_tasks[:50], 1):  # Ограничиваем до 50 задач
-            title = task.get('title', 'Без названия')
+        # Добавляем кнопку для задачи (только если не выполнена)
+        if not completed:
             task_id = task.get('id', '')
-            deadline = task.get('deadline', '')
-            project = task.get('project', '')
-            
-            # Формируем текст кнопки
-            button_text = f"{i}. {title}"
-            if deadline:
-                try:
-                    from datetime import datetime
-                    if 'T' in deadline:
-                        deadline_dt = datetime.fromisoformat(deadline.replace('Z', '+00:00'))
-                        deadline_str = deadline_dt.strftime('%d.%m %H:%M')
-                    else:
-                        deadline_dt = datetime.strptime(deadline, '%Y-%m-%d')
-                        deadline_str = deadline_dt.strftime('%d.%m')
-                    button_text += f" ({deadline_str})"
-                except:
-                    pass
-            
-            if project:
-                button_text += f" [{project}]"
-            
-            # Обрезаем текст кнопки, если слишком длинный
-            if len(button_text) > 60:
-                button_text = button_text[:57] + "..."
-            
-            # Задача: открыть меню | кнопка «Время» — сразу редактировать дату/время
-            keyboard.append([
-                InlineKeyboardButton(button_text, callback_data=f"plan_task_complete_{task_id}"),
-                InlineKeyboardButton("📅 Время", callback_data=f"plan_edit_deadline_{task_id}")
-            ])
+            # Обрезаем название задачи для кнопки, если слишком длинное
+            button_text = task['title'][:40] + "..." if len(task['title']) > 40 else task['title']
+            keyboard.append([InlineKeyboardButton(f"{i}. {button_text}", callback_data=f"task_complete_{task_id}")])
+    
+    # Добавляем кнопку "Назад к проекту"
+    keyboard.append([InlineKeyboardButton("← Назад к проекту", callback_data=f"project_info_{project_name}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    
+    # Сохраняем период расписания в context для последующего использования (если задача будет выполнена)
+    context.user_data['current_schedule_period'] = None  # Не из расписания
+    
+    await query.edit_message_text(text, parse_mode='HTML', reply_markup=reply_markup)
+
+
+async def edit_project_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало редактирования проекта - запрос нового количества шагов"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Извлекаем обрезанное название проекта из callback_data
+    truncated_name = query.data.replace("edit_project_", "")
+    
+    # Получаем полное имя проекта из маппинга (если был сохранен)
+    project_mapping = context.user_data.get('project_name_mapping', {})
+    project_name = project_mapping.get(truncated_name, truncated_name)
+    
+    # Если маппинга нет, пытаемся найти проект по обрезанному имени
+    user_id = query.from_user.id
+    if project_name == truncated_name:
+        projects = get_user_projects(str(user_id))
+        # Ищем проект, который начинается с обрезанного имени или содержит его
+        for proj in projects:
+            if proj.startswith(truncated_name) or truncated_name in proj:
+                project_name = proj
+                break
+    
+    data = load_data()
+    projects_data = data.get('users', {}).get(str(user_id), {}).get('projects_data', {})
+    project_data = projects_data.get(project_name, {})
+    
+    # Проверяем, что проект найден и является проектным
+    if not project_data:
+        await query.answer("Проект не найден", show_alert=True)
+        return ConversationHandler.END
+    
+    project_type = project_data.get('type', 'programmatic')
+    if project_type != 'project':
+        await query.answer("Эта функция доступна только для проектных проектов", show_alert=True)
+        return ConversationHandler.END
+    
+    current_target = project_data.get('target_tasks', 0)
+    
+    context.user_data['edit_project_name'] = project_name
+    
+    await query.edit_message_text(
+        f"Проект: <b>{project_name}</b>\n"
+        f"Текущее количество шагов: {current_target}\n\n"
+        "Введите новое количество шагов:",
+        parse_mode='HTML'
+    )
+    return WAITING_EDIT_PROJECT_TARGET_TASKS
+
+
+async def edit_project_target_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка ввода нового количества шагов проекта"""
+    text = update.message.text.strip()
+    project_name = context.user_data.get('edit_project_name')
+    user_id = update.effective_user.id
+    
+    try:
+        target_tasks = int(text)
+        if target_tasks <= 0:
+            await update.message.reply_text(
+                "Ошибка: Количество шагов должно быть положительным числом. Попробуйте снова:"
+            )
+            return WAITING_EDIT_PROJECT_TARGET_TASKS
+    except ValueError:
+        await update.message.reply_text(
+            "Ошибка: Введите число. Попробуйте снова:"
+        )
+        return WAITING_EDIT_PROJECT_TARGET_TASKS
+    
+    # Проверяем, что проект найден
+    if not project_name:
+        await update.message.reply_text(
+            "Ошибка: Не найдено название проекта. Попробуйте снова."
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+    
+    # Обновляем проект
+    try:
+        update_user_project(str(user_id), project_name, {'target_tasks': target_tasks})
         
-        keyboard.append([InlineKeyboardButton("◀️ Назад к плану", callback_data="plan_back_to_plan")])
+        # Получаем обновленную информацию о проекте
+        data = load_data()
+        projects_data = data.get('users', {}).get(str(user_id), {}).get('projects_data', {})
+        project_data = projects_data.get(project_name, {})
+        project_type = project_data.get('type', 'software')
+        type_name = "Программное" if project_type == "software" else "Проектное"
         
+        # Получаем задачи проекта
+        all_tasks = get_user_tasks(str(user_id))
+        project_tasks = [task for task in all_tasks if task.get('project') == project_name]
+        completed_tasks = sum(1 for task in project_tasks if task.get('completed', False))
+        
+        # Формируем текст с информацией о проекте
+        text = f"✅ Количество шагов проекта <b>{project_name}</b> обновлено до {target_tasks}\n\n"
+        text += f"<b>{project_name}</b>\n"
+        text += f"<i>{type_name}</i>\n\n"
+        
+        if project_type == "project":
+            # Проектное: прогресс по выполненным/запланированным шагам
+            current_target = project_data.get('target_tasks', target_tasks)
+            if current_target is not None and current_target > 0:
+                progress = min(completed_tasks / current_target * 100, 100)
+                text += f"Прогресс: {completed_tasks}/{current_target} задач\n"
+            else:
+                total_tasks = len(project_tasks)
+                if total_tasks > 0:
+                    progress = min(completed_tasks / total_tasks * 100, 100)
+                    text += f"Прогресс: {completed_tasks}/{total_tasks} задач\n"
+                else:
+                    progress = 0
+                    text += f"Прогресс: 0/0 задач\n"
+            
+            # Прогресс бар (20 символов)
+            bar_length = 20
+            filled = int(progress / 100 * bar_length)
+            bar = "█" * filled + "░" * (bar_length - filled)
+            text += f"{bar} {progress:.0f}%\n"
+        
+        # Отправляем сообщение с информацией о проекте
+        keyboard = []
+        if project_type == "project":
+            keyboard.append([InlineKeyboardButton("Задачи по проекту", callback_data=f"project_tasks_{project_name}")])
+            keyboard.append([InlineKeyboardButton("Редактировать проект", callback_data=f"edit_project_{project_name}")])
+            keyboard.append([InlineKeyboardButton("Проект готов?", callback_data=f"project_complete_{project_name}")])
+        else:
+            keyboard.append([InlineKeyboardButton("Задачи по проекту", callback_data=f"project_tasks_{project_name}")])
+        keyboard.append([InlineKeyboardButton("← Назад", callback_data="projects_list")])
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await send_func(
+        await update.message.reply_text(
             text,
             parse_mode='HTML',
             reply_markup=reply_markup
         )
-        
     except Exception as e:
-        print(f"❌ Ошибка при показе управления задачами: {e}")
+        print(f"[ERROR] Ошибка при обновлении количества шагов: {e}")
         import traceback
         traceback.print_exc()
-        await send_func(
-            "❌ Произошла ошибка при загрузке задач",
-            reply_markup=get_plan_keyboard()
+        await update.message.reply_text(
+            f"Ошибка: Не удалось обновить количество шагов.\n\n"
+            f"Ошибка: {str(e)}",
+            parse_mode='HTML'
         )
-
-async def check_deadline_reminders(context: ContextTypes.DEFAULT_TYPE):
-    """Проверка задач с дедлайном сегодня и отправка сводного напоминания в 18:00"""
-    try:
-        current_time = datetime.now()
-        
-        tasks_module = context.application.bot_data.get('tasks_module')
-        if not tasks_module:
-            logger.warning("Модуль задач недоступен для проверки дедлайнов")
-            return
-        
-        # Получаем все данные задач
-        if not hasattr(tasks_module, 'load_data'):
-            logger.warning("tasks_module не имеет метода load_data")
-            return
-        
-        try:
-            data = tasks_module.load_data()
-            if not isinstance(data, dict):
-                logger.warning("load_data вернул не словарь")
-                return
-        except Exception as e:
-            logger.error(f"Ошибка при загрузке данных задач: {e}", exc_info=True)
-            return
-        
-        today = current_time.date()
-        reminders_sent = 0
-        
-        # Проверяем всех пользователей
-        users_data = data.get('users', {})
-        if not isinstance(users_data, dict):
-            logger.warning("users_data не является словарем")
-            return
-        
-        for user_id_str, user_data in users_data.items():
-            if not isinstance(user_data, dict):
-                continue
-            
-            tasks = user_data.get('tasks', [])
-            if not isinstance(tasks, list):
-                continue
-            
-            # Находим задачи с дедлайном сегодня
-            tasks_today = []
-            for task in tasks:
-                if not isinstance(task, dict):
-                    continue
-                
-                # Пропускаем выполненные задачи
-                if task.get('completed', False):
-                    continue
-                
-                deadline = task.get('deadline')
-                if not deadline:
-                    continue
-                
-                try:
-                    # Парсим дедлайн
-                    if isinstance(deadline, str):
-                        if 'T' in deadline:
-                            deadline_dt = datetime.fromisoformat(deadline.replace('Z', '+00:00'))
-                        else:
-                            deadline_dt = datetime.strptime(deadline, '%Y-%m-%d')
-                    else:
-                        continue
-                    
-                    if deadline_dt.tzinfo:
-                        deadline_dt = deadline_dt.replace(tzinfo=None)
-                    
-                    deadline_date = deadline_dt.date()
-                    
-                    # Проверяем, что дедлайн сегодня
-                    if deadline_date == today:
-                        tasks_today.append((task, deadline_dt))
-                
-                except (ValueError, AttributeError) as e:
-                    logger.debug(f"Ошибка при парсинге дедлайна '{deadline}': {e}")
-                    continue
-            
-            # Если есть задачи с дедлайном сегодня, отправляем напоминание
-            if tasks_today:
-                # Формируем сообщение
-                message = "🔔 <b>Напоминание: дедлайн сегодня!</b>\n\n"
-                message += f"У вас <b>{len(tasks_today)}</b> задач с дедлайном на сегодня:\n\n"
-                
-                for i, (task, deadline_dt) in enumerate(tasks_today[:10], 1):  # Ограничиваем до 10 задач
-                    title = task.get('title', 'Без названия')
-                    project = task.get('project', '')
-                    
-                    # Форматируем время дедлайна (показываем только если время не 00:00)
-                    time_str = ''
-                    if deadline_dt.hour != 0 or deadline_dt.minute != 0:
-                        time_str = deadline_dt.strftime('%H:%M')
-                    
-                    task_line = f"{i}. <b>{title}</b>"
-                    if time_str:
-                        task_line += f" ({time_str})"
-                    if project:
-                        task_line += f" [{project}]"
-                    message += task_line + "\n"
-                
-                if len(tasks_today) > 10:
-                    message += f"\n... и еще {len(tasks_today) - 10} задач"
-                
-                # Отправляем сообщение пользователю
-                try:
-                    await context.bot.send_message(
-                        chat_id=int(user_id_str),
-                        text=message,
-                        parse_mode='HTML'
-                    )
-                    reminders_sent += 1
-                    logger.info(f"✅ Напоминание о дедлайнах отправлено пользователю {user_id_str} ({len(tasks_today)} задач)")
-                except Exception as e:
-                    logger.error(f"❌ Ошибка при отправке напоминания пользователю {user_id_str}: {e}", exc_info=True)
-        
-        if reminders_sent > 0:
-            logger.info(f"📅 Напоминания о дедлайнах отправлены {reminders_sent} пользователям")
     
-    except Exception as e:
-        logger.error(f"Ошибка в check_deadline_reminders: {e}", exc_info=True)
+    context.user_data.clear()
+    return ConversationHandler.END
 
 
-async def check_task_reminders_unified(context: ContextTypes.DEFAULT_TYPE):
-    """Периодическая проверка напоминаний по задачам (как в task-manager-bot)"""
+async def edit_projects_list_start(query, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список проектов для редактирования названий"""
+    await query.answer()
+    
+    user_id = query.from_user.id
+    projects = get_user_projects(str(user_id))
+    
+    if not projects:
+        await query.edit_message_text("У вас пока нет проектов для редактирования.")
+        return
+    
+    keyboard = []
+    # Сохраняем маппинг обрезанных имен на полные имена в user_data
+    project_mapping = {}
+    for project in projects:
+        if project:
+            prefix = "edit_project_name_"
+            max_project_bytes = 64 - len(prefix.encode('utf-8')) - 1
+            
+            project_bytes = project.encode('utf-8')
+            if len(project_bytes) > max_project_bytes:
+                truncated_bytes = project_bytes[:max_project_bytes]
+                try:
+                    project_callback = truncated_bytes.decode('utf-8')
+                except UnicodeDecodeError:
+                    project_callback = truncated_bytes[:-1].decode('utf-8', errors='ignore')
+            else:
+                project_callback = project
+            
+            # Сохраняем маппинг
+            project_mapping[project_callback] = project
+            
+            callback_data = f"{prefix}{project_callback}"
+            keyboard.append([InlineKeyboardButton(project, callback_data=callback_data)])
+    
+    # Сохраняем маппинг в context для использования в edit_project_name_start
+    context.user_data['project_name_mapping'] = project_mapping
+    
+    keyboard.append([InlineKeyboardButton("← Назад", callback_data="projects_list")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "<b>Выберите проект для редактирования названия:</b>",
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+
+async def edit_project_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало редактирования названия проекта"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Извлекаем обрезанное имя из callback_data
+    truncated_name = query.data.replace("edit_project_name_", "")
+    
+    # Получаем полное имя проекта из маппинга
+    project_mapping = context.user_data.get('project_name_mapping', {})
+    project_name = project_mapping.get(truncated_name, truncated_name)
+    
+    # Если маппинга нет, пытаемся найти проект по обрезанному имени
+    if project_name == truncated_name:
+        user_id = query.from_user.id
+        projects = get_user_projects(str(user_id))
+        # Ищем проект, который начинается с обрезанного имени
+        for proj in projects:
+            if proj.startswith(truncated_name) or truncated_name in proj:
+                project_name = proj
+                break
+    
+    user_id = query.from_user.id
+    context.user_data['edit_project_name_old'] = project_name
+    
+    await query.edit_message_text(
+        f"Проект: <b>{project_name}</b>\n\n"
+        "Введите новое название проекта:",
+        parse_mode='HTML'
+    )
+    return WAITING_EDIT_PROJECT_NAME
+
+
+async def edit_project_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка ввода нового названия проекта"""
+    text = update.message.text.strip()
+    old_name = context.user_data.get('edit_project_name_old')
+    user_id = update.effective_user.id
+    
+    if not text:
+        await update.message.reply_text("Ошибка: Введите название проекта.")
+        return WAITING_EDIT_PROJECT_NAME
+    
+    if not old_name:
+        await update.message.reply_text("Ошибка: Не найдено старое название проекта. Попробуйте снова.")
+        context.user_data.clear()
+        return ConversationHandler.END
+    
+    new_name = text
+    
+    # Проверяем, что новое имя не занято
+    projects = get_user_projects(str(user_id))
+    data = load_data()
+    projects_data = data.get('users', {}).get(str(user_id), {}).get('projects_data', {})
+    
+    # Проверяем активные проекты (исключая текущий проект)
+    if new_name in projects and new_name != old_name:
+        await update.message.reply_text(
+            f"Ошибка: Проект с названием <b>{new_name}</b> уже существует.",
+            parse_mode='HTML'
+        )
+        return WAITING_EDIT_PROJECT_NAME
+    
+    # Проверяем все проекты (включая завершенные, исключая текущий)
+    if new_name in projects_data and new_name != old_name:
+        await update.message.reply_text(
+            f"Ошибка: Проект с названием <b>{new_name}</b> уже существует.",
+            parse_mode='HTML'
+        )
+        return WAITING_EDIT_PROJECT_NAME
+    
+    # Переименовываем проект
     try:
-        # Получаем модуль задач из bot_data
-        tasks_module = context.application.bot_data.get('tasks_module')
-        if not tasks_module or not hasattr(tasks_module, 'load_data'):
-            logger.warning("tasks_module недоступен для проверки напоминаний задач")
-            return
-        
-        data = tasks_module.load_data()
-        
-        # Используем функцию now() из модуля задач, если есть
-        if hasattr(tasks_module, 'now'):
-            current_time = tasks_module.now()
-            if current_time.tzinfo:
-                current_time = current_time.replace(tzinfo=None)
+        success = rename_user_project(str(user_id), old_name, new_name)
+        if success:
+            await update.message.reply_text(
+                f"✅ Проект переименован: <b>{old_name}</b> → <b>{new_name}</b>",
+                parse_mode='HTML'
+            )
+            
+            # Возвращаемся к информации о проекте с новым именем
+            from telegram import Update as TelegramUpdate
+            fake_query = type('obj', (object,), {
+                'from_user': update.effective_user,
+                'message': update.message,
+                'answer': lambda: None,
+                'edit_message_text': lambda text, **kwargs: update.message.reply_text(text, **kwargs)
+            })()
+            fake_update = TelegramUpdate(update_id=update.update_id, callback_query=fake_query)
+            fake_query.data = f"project_info_{new_name}"
+            await show_project_info(fake_query, context, new_name)
         else:
-            current_time = datetime.now()
-            if current_time.tzinfo:
-                current_time = current_time.replace(tzinfo=None)
+            print(f"[ERROR] Не удалось переименовать проект: old_name='{old_name}', new_name='{new_name}'")
+            await update.message.reply_text(
+                f"Ошибка: Не удалось переименовать проект <b>{old_name}</b>.\n\n"
+                f"Возможные причины:\n"
+                f"• Проект не найден\n"
+                f"• Новое имя уже занято\n"
+                f"• Ошибка сохранения данных",
+                parse_mode='HTML'
+            )
+    except Exception as e:
+        print(f"[ERROR] Исключение при переименовании проекта: {e}")
+        import traceback
+        traceback.print_exc()
+        await update.message.reply_text(
+            f"Ошибка: Произошла ошибка при переименовании проекта: {str(e)}",
+            parse_mode='HTML'
+        )
+    
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def project_complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало подтверждения готовности проекта"""
+    query = update.callback_query
+    await query.answer()
+    
+    project_name = query.data.replace("project_complete_", "")
+    user_id = query.from_user.id
+    context.user_data['complete_project_name'] = project_name
+    
+    keyboard = [
+        [InlineKeyboardButton("Да", callback_data="project_complete_yes")],
+        [InlineKeyboardButton("Нет", callback_data="project_complete_no")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"Проект: <b>{project_name}</b>\n\n"
+        "Проект готов?",
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+    return WAITING_PROJECT_COMPLETE_CONFIRM
+
+
+async def project_complete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение готовности проекта"""
+    query = update.callback_query
+    await query.answer()
+    
+    project_name = context.user_data.get('complete_project_name')
+    user_id = query.from_user.id
+    
+    if query.data == "project_complete_yes":
+        # Помечаем проект как завершенный
+        update_user_project(str(user_id), project_name, {'completed': True})
+        
+        await query.edit_message_text(
+            f"✅ Проект <b>{project_name}</b> завершен!",
+            parse_mode='HTML'
+        )
+        
+        # Возвращаемся к списку проектов
+        from telegram import Update as TelegramUpdate
+        fake_query = type('obj', (object,), {
+            'from_user': query.from_user,
+            'message': query.message,
+            'answer': lambda: None,
+            'edit_message_text': lambda text, **kwargs: query.message.reply_text(text, **kwargs)
+        })()
+        fake_update = TelegramUpdate(update_id=0, callback_query=fake_query)
+        fake_query.data = "projects_list"
+        await projects_list_callback(fake_update, context)
+        
+        context.user_data.clear()
+        return ConversationHandler.END
+    else:
+        # Отмена - возвращаемся к информации о проекте
+        from telegram import Update as TelegramUpdate
+        fake_query = type('obj', (object,), {
+            'from_user': query.from_user,
+            'message': query.message,
+            'answer': lambda: None,
+            'edit_message_text': lambda text, **kwargs: query.message.reply_text(text, **kwargs)
+        })()
+        fake_update = TelegramUpdate(update_id=0, callback_query=fake_query)
+        fake_query.data = f"project_info_{project_name}"
+        await show_project_info(fake_query, context, project_name)
+        
+        context.user_data.clear()
+        return ConversationHandler.END
+
+
+async def projects_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка кнопки "Назад" в списке проектов"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    projects = get_user_projects(str(user_id))
+    
+    if not projects:
+        keyboard = [
+            [InlineKeyboardButton("Добавить...", callback_data="add_project")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "У вас пока нет проектов.",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Создаем кнопки для проектов
+    keyboard = []
+    for project in projects:
+        if project:  # Проверяем, что название проекта не пустое
+            # Telegram ограничивает callback_data до 64 байт
+            prefix = "project_info_"
+            max_project_bytes = 64 - len(prefix.encode('utf-8')) - 1
+            
+            project_bytes = project.encode('utf-8')
+            if len(project_bytes) > max_project_bytes:
+                truncated_bytes = project_bytes[:max_project_bytes]
+                try:
+                    project_callback = truncated_bytes.decode('utf-8')
+                except UnicodeDecodeError:
+                    project_callback = truncated_bytes[:-1].decode('utf-8', errors='ignore')
+            else:
+                project_callback = project
+            
+            callback_data = f"{prefix}{project_callback}"
+            keyboard.append([InlineKeyboardButton(project, callback_data=callback_data)])
+    
+    # Добавляем кнопки "Редактировать", "Статистика" и "Добавить..."
+    keyboard.append([InlineKeyboardButton("Редактировать", callback_data="edit_projects_list")])
+    keyboard.append([InlineKeyboardButton("Статистика", callback_data="projects_summary")])
+    keyboard.append([InlineKeyboardButton("Добавить...", callback_data="add_project")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(
+        f"<b>Проекты</b> ({len(projects)}):",
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+
+# ========== ОБРАБОТЧИКИ СТАТИСТИКИ ==========
+
+async def stats_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню статистики"""
+    user_id = update.effective_user.id
+    tasks = get_user_tasks(str(user_id))
+    projects = get_user_projects(str(user_id))
+    categories = get_user_project_categories(str(user_id))
+    
+    total_tasks = len(tasks)
+    completed_tasks = sum(1 for t in tasks if t.get('completed'))
+    incomplete_tasks = total_tasks - completed_tasks
+    overdue_tasks = sum(1 for t in tasks if not t.get('completed') and t.get('overdue'))
+    
+    text = "<b>Статистика</b>\n\n"
+    text += f"Всего задач: {total_tasks}\n"
+    text += f"Выполнено: {completed_tasks}\n"
+    text += f"Осталось: {incomplete_tasks}\n"
+    text += f"Просрочено: {overdue_tasks}\n"
+    text += f"Проектов: {len(projects)}\n"
+    text += f"Категорий: {len(categories)}\n"
+    
+    await update.message.reply_text(text, parse_mode='HTML')
+
+
+# ========== MAIN ==========
+
+def main():
+    """Основная функция запуска бота"""
+    # Загружаем токен из .env
+    try:
+        env_file = os.path.join(os.path.dirname(__file__), '.env')
+        if os.path.exists(env_file):
+            with open(env_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        value = value.strip().strip("'\"")
+                        os.environ[key] = value
+    except Exception as e:
+        print(f"Ошибка при загрузке .env файла: {e}")
+    
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    
+    if not token:
+        print("Ошибка: Не указан TELEGRAM_BOT_TOKEN!")
+        print("Создайте файл .env с содержимым: TELEGRAM_BOT_TOKEN=ваш_токен")
+        return
+    
+    application = Application.builder().token(token).build()
+    
+    # ConversationHandler для добавления задачи
+    add_task_conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('add', add_task_start),
+            MessageHandler(filters.Regex('^Добавить задачу$'), add_task_start)
+        ],
+        states={
+            WAITING_TASK_TITLE: [
+                MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, add_task_title)
+            ],
+            WAITING_TASK_COMMENT: [
+                CommandHandler('skip', add_task_comment),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_comment),
+                MessageHandler(filters.VOICE, add_task_comment)
+            ],
+            WAITING_TASK_PROJECT: [
+                CallbackQueryHandler(add_task_project_callback, pattern='^project_|^new_project|^skip_project'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_project_text)
+            ],
+            WAITING_TASK_DEADLINE: [
+                MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, add_task_deadline),
+                CommandHandler('skip', add_task_deadline)
+            ],
+            WAITING_TASK_REMINDER: [
+                CallbackQueryHandler(add_task_reminder_callback, pattern='^reminder_|^skip_reminder'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_reminder),
+                CommandHandler('skip', add_task_reminder)
+            ],
+            WAITING_TASK_RECURRENCE: [
+                CallbackQueryHandler(add_task_recurrence_callback, pattern='^recurrence_')
+            ],
+            WAITING_TASK_CATEGORY: [
+                CallbackQueryHandler(add_task_category_callback, pattern='^task_category_')
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        per_message=False,
+        per_chat=True,
+    )
+    
+    application.add_handler(add_task_conv_handler)
+    
+    # ConversationHandler для добавления проекта
+    add_project_conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('addproject', add_project_start),
+            CallbackQueryHandler(add_project_start_callback, pattern='^add_project$')
+        ],
+        states={
+            WAITING_PROJECT_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_project_name)
+            ],
+            WAITING_PROJECT_TYPE: [
+                CallbackQueryHandler(add_project_type_callback, pattern='^project_type_')
+            ],
+            WAITING_PROJECT_TARGET_TASKS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_project_target_tasks)
+            ],
+            WAITING_PROJECT_PRIORITY: [
+                CallbackQueryHandler(add_project_priority_callback, pattern='^project_priority_')
+            ],
+            WAITING_PROJECT_END_DATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_project_end_date),
+                CallbackQueryHandler(add_project_end_date, pattern='^project_end_date_')
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        per_message=False,
+        per_chat=True,
+    )
+    
+    application.add_handler(add_project_conv_handler)
+    
+    # Команды
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('help', help_command))
+    application.add_handler(CommandHandler('list', list_tasks))
+    application.add_handler(CommandHandler('projects', projects_list))
+    application.add_handler(CommandHandler('stats', stats_menu))
+    
+    # ConversationHandler для обработки выполнения задач (регистрируем ПЕРЕД другими callback обработчиками)
+    task_complete_conv_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(task_complete_callback, pattern='^task_complete_')
+        ],
+        states={
+            WAITING_TASK_COMPLETE_CONFIRM: [
+                CallbackQueryHandler(task_confirm_callback, pattern='^task_confirm_')
+            ],
+            WAITING_TASK_RESCHEDULE: [
+                MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, task_reschedule)
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        per_message=False,
+        per_chat=True,
+        per_user=True,
+    )
+    
+    application.add_handler(task_complete_conv_handler)
+    
+    # ConversationHandler для редактирования задач
+    edit_task_conv_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex('^Редактировать$'), edit_task_start)
+        ],
+        states={
+            WAITING_EDIT_TASK_SELECT: [
+                CallbackQueryHandler(edit_task_select_callback, pattern='^edit_task_')
+            ],
+            WAITING_EDIT_FIELD_SELECT: [
+                CallbackQueryHandler(edit_field_select_callback, pattern='^edit_field_|^edit_cancel$')
+            ],
+            WAITING_EDIT_TITLE: [
+                MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, edit_task_title)
+            ],
+            WAITING_EDIT_COMMENT: [
+                MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, edit_task_comment),
+                CommandHandler('skip', edit_task_comment)
+            ],
+            WAITING_EDIT_PROJECT: [
+                CallbackQueryHandler(edit_task_project_callback, pattern='^edit_project_task_|^edit_cancel$')
+            ],
+            WAITING_EDIT_DEADLINE: [
+                MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, edit_task_deadline),
+                CommandHandler('skip', edit_task_deadline)
+            ],
+            WAITING_EDIT_REMINDER: [
+                CallbackQueryHandler(edit_task_reminder_callback, pattern='^edit_reminder_|^edit_cancel$')
+            ],
+            WAITING_EDIT_RECURRENCE: [
+                CallbackQueryHandler(edit_task_recurrence_callback, pattern='^edit_recurrence_|^edit_cancel$')
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        per_message=False,
+        per_chat=True,
+        per_user=True,
+    )
+    
+    application.add_handler(edit_task_conv_handler)
+    
+    # Обработчик кнопки "Список задач" - показывает меню выбора периода
+    application.add_handler(MessageHandler(filters.Regex('^Список задач$'), schedule_menu))
+    application.add_handler(CallbackQueryHandler(schedule_callback, pattern='^schedule_'))
+    
+    # ConversationHandler для редактирования проекта и подтверждения готовности (регистрируем ПЕРЕД другими обработчиками)
+    project_edit_conv_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(edit_project_name_start, pattern='^edit_project_name_'),
+            CallbackQueryHandler(edit_project_start, pattern='^edit_project_[^n]')  # Не начинается с 'n' чтобы не конфликтовать с edit_project_name_
+        ],
+        states={
+            WAITING_EDIT_PROJECT_TARGET_TASKS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^Статистика$|^Проекты$|^Добавить задачу$|^Список задач$|^Редактировать$'), edit_project_target_tasks)
+            ],
+            WAITING_EDIT_PROJECT_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex('^Статистика$|^Проекты$|^Добавить задачу$|^Список задач$|^Редактировать$'), edit_project_name)
+            ],
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            MessageHandler(filters.Regex('^Статистика$|^Проекты$|^Добавить задачу$|^Список задач$|^Редактировать$'), lambda u, c: ConversationHandler.END)
+        ],
+        per_message=False,
+        per_chat=True,
+        per_user=True,
+    )
+    
+    project_complete_conv_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(project_complete_start, pattern='^project_complete_')
+        ],
+        states={
+            WAITING_PROJECT_COMPLETE_CONFIRM: [
+                CallbackQueryHandler(project_complete_confirm, pattern='^project_complete_yes$|^project_complete_no$')
+            ],
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            MessageHandler(filters.Regex('^Статистика$|^Проекты$|^Добавить задачу$|^Список задач$|^Редактировать$'), lambda u, c: ConversationHandler.END)
+        ],
+        per_message=False,
+        per_chat=True,
+        per_user=True,
+    )
+    
+    application.add_handler(project_edit_conv_handler)
+    application.add_handler(project_complete_conv_handler)
+    
+    # Обработчик кнопки "Проекты"
+    application.add_handler(MessageHandler(filters.Regex('^Проекты$'), projects_list))
+    application.add_handler(CallbackQueryHandler(project_info_callback, pattern='^project_info_|^projects_list$|^projects_summary$|^project_tasks_|^edit_projects_list$'))
+    
+    # Обработчик кнопки "Статистика" в главном меню
+    # Регистрируем ПОСЛЕ ConversationHandler, чтобы он имел приоритет при обработке кнопок главного меню
+    application.add_handler(MessageHandler(filters.Regex('^Статистика$'), show_projects_summary_from_menu))
+    
+    if VOICE_SUPPORT:
+        print("✅ Бот запущен! Голосовые сообщения поддерживаются.")
+    else:
+        print("⚠️  Бот запущен! Голосовые сообщения недоступны (установите SpeechRecognition и pydub)")
+    
+    # Функция для проверки и отправки напоминаний
+    async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
+        """Проверка напоминаний и отправка сообщений"""
+        data = load_data()
+        current_time = now()
+        if current_time.tzinfo:
+            current_time = current_time.replace(tzinfo=None)
         
         current_minute = current_time.replace(second=0, microsecond=0)
         reminders_checked = 0
@@ -1626,31 +4964,29 @@ async def check_task_reminders_unified(context: ContextTypes.DEFAULT_TYPE):
                     if reminder_dt.tzinfo:
                         reminder_dt = reminder_dt.replace(tzinfo=None)
                     
-                    # Сравниваем только до минут
+                    # Проверяем, наступило ли время напоминания (с точностью до минуты)
+                    # Сравниваем только дату и время до минут (без секунд)
                     reminder_minute = reminder_dt.replace(second=0, microsecond=0)
                     
+                    # Отправляем напоминание, если текущая минута совпадает с минутой напоминания
                     if reminder_minute == current_minute:
-                        # Ключ, чтобы не слать дубликаты
+                        # Проверяем, не было ли уже отправлено это напоминание
+                        # Используем комбинацию user_id + task_id + дата/время напоминания как ключ
                         reminder_key = f"reminder_{user_id_str}_{task.get('id')}_{reminder_minute.isoformat()}"
                         
                         if not context.bot_data.get(reminder_key, False):
+                            # Формируем сообщение
                             task_title = task.get('title', 'Без названия')
                             deadline_str = task.get('deadline')
                             
-                            message = "🔔 <b>Напоминание о задаче</b>\n\n"
+                            message = f"🔔 <b>Напоминание о задаче</b>\n\n"
                             message += f"<b>{task_title}</b>\n"
                             
                             if deadline_str:
                                 deadline_dt = datetime.fromisoformat(deadline_str)
                                 if deadline_dt.tzinfo:
                                     deadline_dt = deadline_dt.replace(tzinfo=None)
-                                
-                                # Используем форматирование из модуля задач, если есть
-                                if hasattr(tasks_module, 'format_deadline_readable'):
-                                    deadline_formatted = tasks_module.format_deadline_readable(deadline_dt)
-                                else:
-                                    deadline_formatted = deadline_dt.strftime('%d.%m.%Y %H:%M')
-                                
+                                deadline_formatted = format_deadline_readable(deadline_dt)
                                 message += f"Дедлайн: {deadline_formatted}\n"
                             
                             if task.get('comment'):
@@ -1665,2454 +5001,110 @@ async def check_task_reminders_unified(context: ContextTypes.DEFAULT_TYPE):
                                     text=message,
                                     parse_mode='HTML'
                                 )
+                                # Помечаем, что напоминание отправлено
                                 context.bot_data[reminder_key] = True
                                 reminders_sent += 1
-                                logger.info(f"✅ Напоминание по задаче отправлено пользователю {user_id_str} для задачи '{task_title}'")
+                                print(f"✅ Напоминание отправлено пользователю {user_id_str} для задачи '{task.get('title', 'Без названия')}'")
+
+                                # Обновляем время напоминания для регулярных задач
+                                recurrence = task.get('recurrence', 'once')
+                                if recurrence in ('daily', 'weekly'):
+                                    if recurrence == 'daily':
+                                        next_reminder_dt = reminder_dt + timedelta(days=1)
+                                    else:
+                                        next_reminder_dt = reminder_dt + timedelta(days=7)
+
+                                    # Сохраняем новое время напоминания в задаче
+                                    task['reminder'] = next_reminder_dt.isoformat()
+                                    data_changed = True
+
                             except Exception as e:
-                                logger.error(f"❌ Ошибка при отправке напоминания пользователю {user_id_str}: {e}", exc_info=True)
+                                print(f"❌ Ошибка при отправке напоминания пользователю {user_id_str}: {e}")
                 
                 except Exception as e:
-                    logger.error(f"❌ Ошибка при обработке напоминания для задачи {task.get('id')}: {e}", exc_info=True)
+                    print(f"❌ Ошибка при обработке напоминания для задачи {task.get('id')}: {e}")
         
+        # Если изменили данные (переназначили напоминания для регулярных задач) — сохраняем
+        if data_changed:
+            try:
+                save_data(data)
+            except Exception as e:
+                print(f"❌ Ошибка сохранения данных после обновления напоминаний: {e}")
+
+        # Логируем статистику (только если были проверки)
         if reminders_checked > 0:
-            logger.info(f"[Напоминания задач] Проверено: {reminders_checked}, отправлено: {reminders_sent}, текущее время: {current_minute.strftime('%Y-%m-%d %H:%M')}")
+            print(f"[Напоминания] Проверено: {reminders_checked}, отправлено: {reminders_sent}, текущее время: {current_minute.strftime('%Y-%m-%d %H:%M')}")
         
-        # Чистим старые ключи напоминаний (старше 1 часа)
+        # Очищаем старые флаги отправленных напоминаний (старше 1 часа)
         current_keys = list(context.bot_data.keys())
         for key in current_keys:
             if key.startswith("reminder_"):
+                # Извлекаем дату/время из ключа (формат: reminder_{user_id}_{task_id}_{iso_datetime})
                 try:
                     parts = key.split('_')
                     if len(parts) >= 4:
+                        # Последняя часть - это ISO datetime
                         reminder_datetime_str = '_'.join(parts[3:])
                         reminder_datetime = datetime.fromisoformat(reminder_datetime_str)
+                        # Удаляем флаги старше 1 часа
                         if (current_time - reminder_datetime).total_seconds() > 3600:
                             del context.bot_data[key]
                 except Exception:
-                    continue
-    except Exception as e:
-        logger.error(f"Ошибка в check_task_reminders_unified: {e}", exc_info=True)
-
-
-def load_env_file(env_path: str) -> bool:
-    """Загрузить переменные окружения из .env файла
+                    # Если не удалось распарсить, пропускаем
+                    pass
     
-    Returns:
-        True если файл успешно загружен, False в противном случае
-    """
+    # Добавляем периодическую задачу для проверки напоминаний (каждую минуту)
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(check_reminders, interval=60, first=10)  # Каждую минуту, первый запуск через 10 секунд
+    
+    print("Бот запущен! (с кнопкой 'Добавить задачу')")
+    print("Попытка подключения к Telegram API...")
+    
+    # Запускаем бота с обработкой ошибок подключения
     try:
-        if not os.path.exists(env_path):
-            logger.warning(f"Файл .env не найден: {env_path}")
-            return False
-        
-        with open(env_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    try:
-                        key, value = line.split('=', 1)
-                        key = key.strip()
-                        value = value.strip().strip("'\"")
-                        os.environ[key] = value
-                    except ValueError as e:
-                        logger.warning(f"Неверный формат строки {line_num} в .env: {line}")
-        
-        logger.info("Файл .env успешно загружен")
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка при загрузке .env файла: {e}", exc_info=True)
-        return False
-
-def load_module(module_path: str, module_name: str) -> Optional[Any]:
-    """Загрузить модуль из файла
-    
-    Args:
-        module_path: Путь к файлу модуля
-        module_name: Имя модуля для логирования
-    
-    Returns:
-        Загруженный модуль или None в случае ошибки
-    """
-    try:
-        if not os.path.exists(module_path):
-            logger.error(f"Файл модуля {module_name} не найден: {module_path}")
-            return None
-        
-        spec = importlib.util.spec_from_file_location(module_name, module_path)
-        if spec is None or spec.loader is None:
-            logger.error(f"Не удалось создать spec для модуля {module_name}")
-            return None
-        
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        logger.info(f"✅ Модуль {module_name} успешно загружен")
-        return module
-    except Exception as e:
-        logger.error(f"❌ Ошибка при загрузке модуля {module_name}: {e}", exc_info=True)
-        return None
-
-def main():
-    """Основная функция запуска объединенного бота"""
-    # Загружаем токен из .env (локально) или из переменных окружения (Railway и т.п.)
-    env_file = os.path.join(os.path.dirname(__file__), '.env')
-    load_env_file(env_file)
-    
-    token = os.getenv('TELEGRAM_BOT_TOKEN') or os.environ.get('TELEGRAM_BOT_TOKEN')
-    
-    # Диагностика: какие переменные с TELEGRAM видны (без вывода значения токена)
-    telegram_vars = [k for k in os.environ if 'TELEGRAM' in k.upper()]
-    logger.info(f"Переменные окружения с TELEGRAM: {telegram_vars if telegram_vars else 'нет'}")
-    if token:
-        logger.info(f"TELEGRAM_BOT_TOKEN найден, длина: {len(token)}")
-    
-    if not token:
-        logger.error("Не указан TELEGRAM_BOT_TOKEN!")
-        logger.error("Создайте файл .env с содержимым: TELEGRAM_BOT_TOKEN=ваш_токен")
-        return
-    
-    # Загружаем модули ботов один раз при старте
-    schedule_module = None
-    tasks_module = None
-    
-    schedule_bot_path = str(BASE_DIR / 'schedule-bot' / 'bot.py')
-    schedule_module = load_module(schedule_bot_path, "schedule_bot")
-    
-    tasks_bot_path = str(BASE_DIR / 'task-manager-bot' / 'bot_advanced.py')
-    tasks_module = load_module(tasks_bot_path, "tasks_bot")
-    
-    if not schedule_module and not tasks_module:
-        logger.error("Не удалось загрузить ни один из модулей бота!")
-        logger.error("Проверьте пути к модулям в коде")
-        return
-    
-    # Настройка команд бота для подсказок
-    async def post_init(app: Application) -> None:
-        """Инициализация после создания приложения"""
-        try:
-            commands = [
-                BotCommand("start", "Начать работу с ботом")
-            ]
-            await app.bot.set_my_commands(commands)
-            logger.info("Команды бота установлены")
-        except Exception as e:
-            logger.error(f"Ошибка при установке команд бота: {e}", exc_info=True)
-        
-        # Сохраняем модули в bot_data после создания приложения
-        app.bot_data['schedule_module'] = schedule_module
-        app.bot_data['tasks_module'] = tasks_module
-        logger.info("Модули сохранены в bot_data")
-        
-        # Настраиваем фоновые задачи напоминаний
-        try:
-            job_queue = app.job_queue
-            if job_queue:
-                # 1) Сводное напоминание о задачах с дедлайном сегодня в 18:00
-                job_queue.run_daily(
-                    check_deadline_reminders,
-                    time=time(18, 0),
-                    name="deadline_deadlines_summary"
-                )
-                logger.info("✅ Сводные напоминания о дедлайнах настроены на 18:00 каждый день")
-
-                # 2) Минутные напоминания по событиям расписания (из schedule_bot)
-                if schedule_module and hasattr(schedule_module, 'send_reminders'):
-                    job_queue.run_repeating(
-                        schedule_module.send_reminders,
-                        interval=60,
-                        first=10,
-                        name="schedule_event_reminders"
-                    )
-                    logger.info("✅ Минутные напоминания по событиям расписания активированы")
-                else:
-                    logger.warning("schedule_module.send_reminders недоступен, напоминания по событиям не будут работать")
-
-                # 3) Минутные напоминания по задачам (как в task-manager-bot)
-                job_queue.run_repeating(
-                    check_task_reminders_unified,
-                    interval=60,
-                    first=10,
-                    name="task_reminders"
-                )
-                logger.info("✅ Минутные напоминания по задачам активированы")
-            else:
-                logger.warning("job_queue недоступен для настройки напоминаний")
-        except Exception as e:
-            logger.error(f"Ошибка при настройке напоминаний: {e}", exc_info=True)
-    
-    # Создаем приложение с поддержкой job_queue для напоминаний и post_init
-    # job_queue включен по умолчанию в python-telegram-bot 20.x
-    application = Application.builder().token(token).post_init(post_init).build()
-    
-    # ВАЖНО: ConversationHandler должны быть зарегистрированы ПЕРВЫМИ!
-    # Регистрируем обработчики из бота расписания (если модуль загружен)
-    if schedule_module:
-        try:
-            # Переопределяем get_main_keyboard в модуле расписания глобально для unified_bot
-            # Это гарантирует, что все функции завершения будут использовать правильную клавиатуру
-            if hasattr(schedule_module, 'get_main_keyboard'):
-                schedule_module.get_main_keyboard = get_schedule_keyboard
-                logger.info("✅ get_main_keyboard переопределен для раздела расписания")
-            
-            # Переопределяем функции категорий, чтобы они использовали проекты из tasks_module
-            if tasks_module:
-                def get_user_categories_unified(user_id: str):
-                    """Получение категорий пользователя через проекты"""
-                    # Получаем проекты из tasks_module
-                    try:
-                        if not hasattr(tasks_module, 'get_user_projects'):
-                            logger.warning("tasks_module не имеет метода get_user_projects")
-                            return {'other': 'остальное'}
-                        
-                        projects = tasks_module.get_user_projects(str(user_id))
-                        if not isinstance(projects, list):
-                            logger.warning(f"get_user_projects вернул не список: {type(projects)}")
-                            projects = []
-                    except Exception as e:
-                        logger.error(f"Ошибка при получении проектов для пользователя {user_id}: {e}", exc_info=True)
-                        projects = []
-                    
-                    # Преобразуем проекты в формат категорий {project_name: project_name}
-                    # Используем имя проекта как и ID, и название для совместимости
-                    categories = {}
-                    for project in projects:
-                        if project and isinstance(project, str):  # Проверяем, что проект не пустой и строка
-                            # Используем имя проекта как ключ и значение
-                            categories[project] = project
-                    
-                    # Если проектов нет, возвращаем дефолтную категорию
-                    if not categories:
-                        categories['other'] = 'остальное'
-                    
-                    return categories
-                
-                def add_user_category_unified(user_id: str, category_id: str, category_name: str):
-                    """Добавление категории через создание проекта"""
-                    # Используем category_name как имя проекта
-                    try:
-                        if not hasattr(tasks_module, 'get_user_projects') or not hasattr(tasks_module, 'load_data'):
-                            logger.warning("tasks_module не имеет необходимых методов для добавления категории")
-                            return
-                        
-                        # Проверяем, существует ли проект
-                        projects = tasks_module.get_user_projects(str(user_id))
-                        if not isinstance(projects, list):
-                            logger.warning(f"get_user_projects вернул не список: {type(projects)}")
-                            projects = []
-                        
-                        if category_name not in projects:
-                            # Создаем новый проект через tasks_module
-                            data = tasks_module.load_data()
-                            if not isinstance(data, dict):
-                                logger.error("load_data вернул не словарь")
-                                return
-                            
-                            user_id_str = str(user_id)
-                            if 'users' not in data:
-                                data['users'] = {}
-                            if user_id_str not in data['users']:
-                                data['users'][user_id_str] = {'tasks': [], 'projects': [], 'tags': [], 'projects_data': {}}
-                            if 'projects_data' not in data['users'][user_id_str]:
-                                data['users'][user_id_str]['projects_data'] = {}
-                            
-                            # Добавляем проект
-                            from datetime import datetime
-                            data['users'][user_id_str]['projects_data'][category_name] = {
-                                'completed': False,
-                                'created_at': datetime.now().isoformat()
-                            }
-                            
-                            if hasattr(tasks_module, 'save_data'):
-                                tasks_module.save_data(data)
-                                logger.info(f"✅ Проект '{category_name}' добавлен для пользователя {user_id}")
-                            else:
-                                logger.error("tasks_module не имеет метода save_data")
-                    except Exception as e:
-                        logger.error(f"Ошибка при добавлении проекта '{category_name}' для пользователя {user_id}: {e}", exc_info=True)
-                
-                def delete_user_category_unified(user_id: str, category_id: str) -> bool:
-                    """Удаление категории через удаление проекта"""
-                    try:
-                        if not hasattr(tasks_module, 'load_data') or not hasattr(tasks_module, 'get_user_projects'):
-                            logger.warning("tasks_module не имеет необходимых методов для удаления категории")
-                            return False
-                        
-                        # Используем category_id как имя проекта
-                        data = tasks_module.load_data()
-                        if not isinstance(data, dict):
-                            logger.error("load_data вернул не словарь")
-                            return False
-                        
-                        user_id_str = str(user_id)
-                        if 'users' not in data or user_id_str not in data['users']:
-                            logger.debug(f"Пользователь {user_id} не найден в данных")
-                            return False
-                        
-                        projects_data = data['users'][user_id_str].get('projects_data', {})
-                        if category_id in projects_data:
-                            # Нельзя удалить последний проект (должен остаться хотя бы один)
-                            active_projects = tasks_module.get_user_projects(str(user_id))
-                            if not isinstance(active_projects, list):
-                                logger.warning("get_user_projects вернул не список")
-                                active_projects = []
-                            
-                            if len(active_projects) <= 1:
-                                logger.info(f"Нельзя удалить последний проект для пользователя {user_id}")
-                                return False
-                            
-                            del projects_data[category_id]
-                            
-                            # Также обновляем задачи, убирая ссылку на проект
-                            tasks = data['users'][user_id_str].get('tasks', [])
-                            for task in tasks:
-                                if isinstance(task, dict) and task.get('project') == category_id:
-                                    task['project'] = None
-                            
-                            # Обновляем события, убирая ссылку на категорию
-                            if schedule_module and hasattr(schedule_module, 'get_user_events'):
-                                try:
-                                    events = schedule_module.get_user_events(str(user_id))
-                                    if isinstance(events, list):
-                                        updated = False
-                                        for event in events:
-                                            if isinstance(event, dict) and event.get('category') == category_id:
-                                                event['category'] = 'other'
-                                                updated = True
-                                        
-                                        if updated and hasattr(schedule_module, 'update_user_event'):
-                                            # Сохраняем обновленные события через update_user_event
-                                            for event in events:
-                                                if isinstance(event, dict) and event.get('category') == 'other' and 'id' in event:
-                                                    schedule_module.update_user_event(str(user_id), event['id'], event)
-                                except Exception as e:
-                                    logger.error(f"Ошибка при обновлении событий при удалении категории: {e}", exc_info=True)
-                            
-                            if hasattr(tasks_module, 'save_data'):
-                                tasks_module.save_data(data)
-                                logger.info(f"✅ Категория '{category_id}' удалена для пользователя {user_id}")
-                                return True
-                            else:
-                                logger.error("tasks_module не имеет метода save_data")
-                                return False
-                        
-                        return False
-                    except Exception as e:
-                        logger.error(f"Ошибка при удалении категории '{category_id}' для пользователя {user_id}: {e}", exc_info=True)
-                        return False
-                
-                def update_user_category_unified(user_id: str, category_id: str, new_name: str):
-                    """Обновление категории через переименование проекта"""
-                    try:
-                        if not hasattr(tasks_module, 'rename_user_project'):
-                            logger.warning("tasks_module не имеет метода rename_user_project")
-                            return False
-                        
-                        # Используем tasks_module.rename_user_project
-                        result = tasks_module.rename_user_project(str(user_id), category_id, new_name)
-                        if result:
-                            # Также обновляем события, которые используют эту категорию
-                            if schedule_module and hasattr(schedule_module, 'get_user_events'):
-                                try:
-                                    events = schedule_module.get_user_events(str(user_id))
-                                    if isinstance(events, list):
-                                        updated = False
-                                        for event in events:
-                                            if isinstance(event, dict) and event.get('category') == category_id:
-                                                event['category'] = new_name
-                                                updated = True
-                                        
-                                        if updated:
-                                            # Сохраняем обновленные события
-                                            if hasattr(schedule_module, 'save_user_events'):
-                                                schedule_module.save_user_events(str(user_id), events)
-                                            elif hasattr(schedule_module, 'save_data'):
-                                                # Альтернативный способ сохранения
-                                                data = schedule_module.load_data() if hasattr(schedule_module, 'load_data') else {}
-                                                if isinstance(data, dict) and 'users' in data and str(user_id) in data['users']:
-                                                    data['users'][str(user_id)]['events'] = events
-                                                    schedule_module.save_data(data)
-                                except Exception as e:
-                                    logger.error(f"Ошибка при обновлении событий при переименовании категории: {e}", exc_info=True)
-                        
-                        return result
-                    except Exception as e:
-                        logger.error(f"Ошибка при обновлении категории '{category_id}' для пользователя {user_id}: {e}", exc_info=True)
-                        return False
-                
-                # Переопределяем функции категорий в schedule_module
-                schedule_module.get_user_categories = get_user_categories_unified
-                schedule_module.add_user_category = add_user_category_unified
-                schedule_module.delete_user_category = delete_user_category_unified
-                schedule_module.update_user_category = update_user_category_unified
-                logger.info("✅ Функции категорий переопределены для использования проектов")
-            
-            # Используем обертки из модуля wrappers
-            
-            # ConversationHandler для добавления события - РЕГИСТРИРУЕМ ПЕРВЫМ!
-            # Проверяем наличие необходимых функций и состояний
-            if (hasattr(schedule_module, 'add_event_start') and 
-                hasattr(schedule_module, 'add_event_title') and
-                hasattr(schedule_module, 'WAITING_TITLE')):
-                try:
-                    # Получаем состояния из модуля
-                    WAITING_TITLE = schedule_module.WAITING_TITLE
-                    WAITING_DATE = schedule_module.WAITING_DATE
-                    WAITING_TIME = schedule_module.WAITING_TIME
-                    WAITING_DESCRIPTION = schedule_module.WAITING_DESCRIPTION
-                    WAITING_CATEGORY = schedule_module.WAITING_CATEGORY
-                    WAITING_REPEAT = schedule_module.WAITING_REPEAT
-                    # Проверяем наличие WAITING_REMINDER_1
-                    WAITING_REMINDER_1 = getattr(schedule_module, 'WAITING_REMINDER_1', None)
-                    
-                    # Используем обертки из модуля wrappers
-                    
-                    # Создаем обертку для add_event_title с поддержкой голоса и измененным порядком
-                    async def add_event_title_with_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                        """Обертка для add_event_title с поддержкой голосовых сообщений и измененным порядком"""
-                        # Устанавливаем режим расписания
-                        context.user_data['bot_mode'] = MODE_SCHEDULE
-                        
-                        raw_text = None
-                        
-                        # Если это голосовое сообщение, обрабатываем его
-                        if update.message.voice:
-                            # Используем функции из tasks_module для обработки голоса
-                            if tasks_module and hasattr(tasks_module, 'transcribe_voice'):
-                                try:
-                                    print(f"Получено голосовое сообщение для события: duration={update.message.voice.duration}")
-                                    
-                                    # Пробуем использовать caption от Telegram (если есть)
-                                    if update.message.caption:
-                                        raw_text = update.message.caption.strip()
-                                        print(f"Использован caption от Telegram: {raw_text}")
-                                        if hasattr(tasks_module, 'normalize_voice_text'):
-                                            raw_text = tasks_module.normalize_voice_text(raw_text)
-                                    else:
-                                        # Получаем файл голосового сообщения
-                                        voice_file = await update.message.voice.get_file()
-                                        print(f"Файл получен: file_path={voice_file.file_path}")
-                                        
-                                        # Транскрибируем голос
-                                        transcribed_text = await tasks_module.transcribe_voice(voice_file, update)
-                                        
-                                        if transcribed_text:
-                                            raw_text = transcribed_text.strip()
-                                            print(f"✅ Успешно распознано: {raw_text}")
-                                        else:
-                                            print("❌ Не удалось распознать голосовое сообщение")
-                                            await update.message.reply_text(
-                                                "Не удалось распознать голосовое сообщение.\n\n"
-                                                "💡 Попробуйте:\n"
-                                                "• Говорить четче и медленнее\n"
-                                                "• Уменьшить фоновый шум\n"
-                                                "• Написать текст вместо голосового сообщения"
-                                            )
-                                            return WAITING_TITLE
-                                    
-                                    # Заменяем текст сообщения на распознанный текст
-                                    update.message.text = raw_text
-                                    
-                                except Exception as e:
-                                    print(f"❌ Ошибка при обработке голосового сообщения: {e}")
-                                    import traceback
-                                    traceback.print_exc()
-                                    await update.message.reply_text("Ошибка обработки голосового сообщения. Попробуйте написать текст:")
-                                    return WAITING_TITLE
-                            else:
-                                await update.message.reply_text("Повторите текстом:")
-                                return WAITING_TITLE
-                        elif update.message.text:
-                            raw_text = update.message.text.strip()
-                        
-                        if not raw_text:
-                            await update.message.reply_text("Ошибка: Название события не может быть пустым. Попробуйте снова:")
-                            return WAITING_TITLE
-                        
-                        # Сохраняем название события
-                        if 'new_event' not in context.user_data:
-                            context.user_data['new_event'] = {}
-                        context.user_data['new_event']['title'] = raw_text
-                        
-                        # Сохраняем ID сообщения пользователя (используем функцию из schedule_module если есть)
-                        if hasattr(schedule_module, 'add_user_message_id'):
-                            schedule_module.add_user_message_id(update.effective_user.id, update.message.message_id)
-                        
-                        # Изменяем порядок: после названия переходим к описанию (как в задачах)
-                        msg = await update.message.reply_text(
-                            "Что-то уточним, или /skip",
-                            parse_mode='HTML'
-                        )
-                        if hasattr(schedule_module, 'add_message_id'):
-                            schedule_module.add_message_id(update.effective_user.id, msg.message_id)
-                        
-                        return WAITING_DESCRIPTION
-                    
-                    # Создаем обертку для add_event_description с измененным порядком
-                    async def add_event_description_reordered(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                        """Обертка для add_event_description с измененным порядком (после описания -> категория)"""
-                        # Устанавливаем режим расписания
-                        context.user_data['bot_mode'] = MODE_SCHEDULE
-                        
-                        description_text = None
-                        
-                        # Обрабатываем голосовое сообщение если есть
-                        if update.message.voice:
-                            if tasks_module and hasattr(tasks_module, 'transcribe_voice'):
-                                try:
-                                    print(f"Получено голосовое сообщение для описания события")
-                                    
-                                    if update.message.caption:
-                                        description_text = update.message.caption.strip()
-                                        if hasattr(tasks_module, 'normalize_voice_text'):
-                                            description_text = tasks_module.normalize_voice_text(description_text)
-                                    else:
-                                        voice_file = await update.message.voice.get_file()
-                                        transcribed_text = await tasks_module.transcribe_voice(voice_file, update)
-                                        if transcribed_text:
-                                            description_text = transcribed_text.strip()
-                                            await update.message.reply_text(description_text)
-                                        else:
-                                            await update.message.reply_text(
-                                                "Не удалось распознать голосовое сообщение. Попробуйте написать текст или /skip"
-                                            )
-                                            return WAITING_DESCRIPTION
-                                except Exception as e:
-                                    print(f"❌ Ошибка при обработке голосового сообщения: {e}")
-                                    await update.message.reply_text("Ошибка обработки голосового сообщения. Попробуйте написать текст или /skip:")
-                                    return WAITING_DESCRIPTION
-                            else:
-                                await update.message.reply_text("Повторите текстом или /skip:")
-                                return WAITING_DESCRIPTION
-                        elif update.message.text:
-                            if update.message.text.lower() != '/skip':
-                                description_text = update.message.text.strip()
-                            else:
-                                description_text = ''
-                        
-                        # Сохраняем описание
-                        if 'new_event' not in context.user_data:
-                            context.user_data['new_event'] = {}
-                        context.user_data['new_event']['description'] = description_text if description_text else ''
-                        
-                        # Сохраняем ID сообщения пользователя
-                        if update.message.text.lower() != '/skip':
-                            if hasattr(schedule_module, 'add_user_message_id'):
-                                schedule_module.add_user_message_id(update.effective_user.id, update.message.message_id)
-                        
-                        # После описания переходим к категории (как в задачах после комментария переходят к проекту)
-                        user_id = update.effective_user.id
-                        user_categories = schedule_module.get_user_categories(user_id)
-                        
-                        # Проверяем, есть ли категории у пользователя
-                        if not user_categories or len(user_categories) == 0:
-                            keyboard = [
-                                [InlineKeyboardButton("Создать категории", callback_data="manage_categories")]
-                            ]
-                            reply_markup = InlineKeyboardMarkup(keyboard)
-                            msg = await update.message.reply_text(
-                                "У вас пока нет категорий. Создайте их, чтобы продолжить добавление события.",
-                                reply_markup=reply_markup,
-                                parse_mode='HTML'
-                            )
-                            if hasattr(schedule_module, 'add_message_id'):
-                                schedule_module.add_message_id(user_id, msg.message_id)
-                            return WAITING_CATEGORY
-                        
-                        # Создаём клавиатуру с категориями пользователя
-                        keyboard = []
-                        for key, value in user_categories.items():
-                            keyboard.append([InlineKeyboardButton(value, callback_data=f"category_{key}")])
-                        
-                        # Добавляем кнопку для управления категориями
-                        keyboard.append([InlineKeyboardButton("управление категориями", callback_data="manage_categories")])
-                        
-                        reply_markup = InlineKeyboardMarkup(keyboard)
-                        
-                        msg = await update.message.reply_text(
-                            "Выберите <b>категорию</b> события:",
-                            reply_markup=reply_markup,
-                            parse_mode='HTML'
-                        )
-                        if hasattr(schedule_module, 'add_message_id'):
-                            schedule_module.add_message_id(user_id, msg.message_id)
-                        return WAITING_CATEGORY
-                    
-                    # Создаем обертку для add_event_category с измененным порядком
-                    async def add_event_category_reordered(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                        """Обертка для add_event_category с измененным порядком (после категории -> дата)"""
-                        # Устанавливаем режим расписания
-                        context.user_data['bot_mode'] = MODE_SCHEDULE
-                        
-                        query = update.callback_query
-                        await query.answer()
-                        
-                        category = query.data.replace('category_', '')
-                        if 'new_event' not in context.user_data:
-                            context.user_data['new_event'] = {}
-                        context.user_data['new_event']['category'] = category
-                        
-                        # После категории переходим к дате (как в задачах после проекта переходят к дедлайну)
-                        msg = await query.edit_message_text(
-                            "Введите дату события:\n\n"
-                            "Примеры:\n"
-                            "• сегодня\n"
-                            "• завтра\n"
-                            "• послезавтра\n"
-                            "• понедельник\n"
-                            "• 17 января\n"
-                            "• 19 01\n"
-                            "• 25.12.2024",
-                            parse_mode='HTML'
-                        )
-                        if hasattr(schedule_module, 'add_message_id'):
-                            schedule_module.add_message_id(query.from_user.id, msg.message_id)
-                        
-                        return WAITING_DATE
-                    
-                    # Создаем обертку для add_event_time с измененным порядком
-                    async def add_event_time_reordered(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                        """Обертка для add_event_time с измененным порядком (после времени -> напоминание)"""
-                        # Устанавливаем режим расписания
-                        context.user_data['bot_mode'] = MODE_SCHEDULE
-                        
-                        # Вызываем оригинальную функцию, но перехватываем возвращаемое значение
-                        # Временно заменяем текст сообщения, чтобы функция работала правильно
-                        original_text = update.message.text
-                        result = await schedule_module.add_event_time(update, context)
-                        
-                        # Если функция вернула WAITING_DESCRIPTION, меняем на WAITING_REMINDER_1 или WAITING_REPEAT
-                        if result == schedule_module.WAITING_DESCRIPTION:
-                            # После времени переходим к напоминанию (как в задачах после дедлайна переходят к напоминанию)
-                            if WAITING_REMINDER_1 is not None:
-                                # Создаем клавиатуру для выбора напоминания
-                                keyboard = [
-                                    [InlineKeyboardButton("За 15 минут", callback_data="reminder_15")],
-                                    [InlineKeyboardButton("За 30 минут", callback_data="reminder_30")],
-                                    [InlineKeyboardButton("За 1 час", callback_data="reminder_60")],
-                                    [InlineKeyboardButton("За 2 часа", callback_data="reminder_120")],
-                                    [InlineKeyboardButton("Без напоминания", callback_data="reminder_0")]
-                                ]
-                                reply_markup = InlineKeyboardMarkup(keyboard)
-                                
-                                msg = await update.message.reply_text(
-                                    "Выберите напоминание:",
-                                    reply_markup=reply_markup,
-                                    parse_mode='HTML'
-                                )
-                                if hasattr(schedule_module, 'add_message_id'):
-                                    schedule_module.add_message_id(update.effective_user.id, msg.message_id)
-                                return WAITING_REMINDER_1
-                            else:
-                                # Если нет напоминания, переходим к повторению
-                                keyboard = [
-                                    [InlineKeyboardButton("Одноразовое", callback_data="repeat_once")],
-                                    [InlineKeyboardButton("Ежедневное", callback_data="repeat_daily")],
-                                    [InlineKeyboardButton("Еженедельное", callback_data="repeat_weekly")]
-                                ]
-                                reply_markup = InlineKeyboardMarkup(keyboard)
-                                
-                                msg = await update.message.reply_text(
-                                    "Выберите тип повторения:",
-                                    reply_markup=reply_markup
-                                )
-                                if hasattr(schedule_module, 'add_message_id'):
-                                    schedule_module.add_message_id(update.effective_user.id, msg.message_id)
-                                return WAITING_REPEAT
-                        
-                        return result
-                    
-                    # Создаем states для ConversationHandler (оборачиваем функции для правильного режима)
-                    states = {
-                        WAITING_TITLE: [
-                            MessageHandler(
-                                (filters.TEXT | filters.VOICE) & ~filters.COMMAND,
-                                wrap_schedule_handler(add_event_title_with_voice)
-                            )
-                        ],
-                        WAITING_DATE: [
-                            MessageHandler(
-                                filters.TEXT & ~filters.COMMAND,
-                                wrap_schedule_handler(schedule_module.add_event_date)
-                            )
-                        ],
-                        WAITING_TIME: [
-                            MessageHandler(
-                                filters.TEXT & ~filters.COMMAND,
-                                wrap_schedule_handler(add_event_time_reordered)
-                            )
-                        ],
-                        WAITING_DESCRIPTION: [
-                            MessageHandler(
-                                (filters.TEXT | filters.VOICE) & ~filters.COMMAND,
-                                wrap_schedule_handler(add_event_description_reordered)
-                            ),
-                            CommandHandler('skip', wrap_schedule_handler(add_event_description_reordered))
-                        ],
-                        WAITING_CATEGORY: [
-                            CallbackQueryHandler(
-                                wrap_schedule_handler(add_event_category_reordered),
-                                pattern='^category_'
-                            ),
-                            CallbackQueryHandler(
-                                wrap_schedule_handler(schedule_module.manage_categories),
-                                pattern='^manage_categories$'
-                            ),
-                            CallbackQueryHandler(
-                                wrap_schedule_handler(schedule_module.back_to_category_selection),
-                                pattern='^back_to_category_selection$'
-                            ) if hasattr(schedule_module, 'back_to_category_selection') else None
-                        ],
-                        WAITING_REPEAT: [
-                            CallbackQueryHandler(
-                                wrap_schedule_handler(add_event_repeat_reordered),
-                                pattern='^repeat_'
-                            )
-                        ],
-                    }
-                    
-                    # Добавляем дополнительные обработчики для категорий если есть
-                    if hasattr(schedule_module, 'manage_categories'):
-                        states[WAITING_CATEGORY].append(
-                            CallbackQueryHandler(
-                                wrap_schedule_handler(schedule_module.manage_categories),
-                                pattern='^manage_categories$'
-                            )
-                        )
-                    if hasattr(schedule_module, 'back_to_category_selection'):
-                        states[WAITING_CATEGORY].append(
-                            CallbackQueryHandler(
-                                wrap_schedule_handler(schedule_module.back_to_category_selection),
-                                pattern='^back_to_category_selection$'
-                            )
-                        )
-                    
-                    # Создаем обертку для add_event_reminder_1 с измененным порядком
-                    async def add_event_reminder_1_reordered(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                        """Обертка для add_event_reminder_1 с измененным порядком (после напоминания -> повторение)"""
-                        # Устанавливаем режим расписания
-                        context.user_data['bot_mode'] = MODE_SCHEDULE
-                        
-                        query = update.callback_query
-                        await query.answer()
-                        
-                        reminder_data = query.data.replace('reminder_', '')
-                        
-                        if reminder_data == 'none' or reminder_data == '0':
-                            # Если выбрано "Без напоминания", сохраняем пустой список
-                            if 'new_event' not in context.user_data:
-                                context.user_data['new_event'] = {}
-                            context.user_data['new_event']['reminders'] = []
-                        else:
-                            # Сохраняем напоминание
-                            reminder_minutes = int(reminder_data)
-                            if 'new_event' not in context.user_data:
-                                context.user_data['new_event'] = {}
-                            if 'reminders' not in context.user_data['new_event']:
-                                context.user_data['new_event']['reminders'] = []
-                            context.user_data['new_event']['reminders'] = [reminder_minutes]
-                        
-                        # После напоминания переходим к повторению (как в задачах после напоминания переходят к регулярности)
-                        keyboard = [
-                            [InlineKeyboardButton("Одноразовое", callback_data="repeat_once")],
-                            [InlineKeyboardButton("Ежедневное", callback_data="repeat_daily")],
-                            [InlineKeyboardButton("Еженедельное", callback_data="repeat_weekly")]
-                        ]
-                        reply_markup = InlineKeyboardMarkup(keyboard)
-                        
-                        msg = await query.edit_message_text(
-                            "Выберите тип повторения:",
-                            reply_markup=reply_markup
-                        )
-                        if hasattr(schedule_module, 'add_message_id'):
-                            schedule_module.add_message_id(query.from_user.id, msg.message_id)
-                        
-                        return WAITING_REPEAT
-                    
-                    # Создаем обертку для add_event_repeat с измененным порядком
-                    async def add_event_repeat_reordered(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                        """Обертка для add_event_repeat с измененным порядком (после повторения -> завершение)"""
-                        # Устанавливаем режим расписания
-                        context.user_data['bot_mode'] = MODE_SCHEDULE
-                        
-                        query = update.callback_query
-                        await query.answer()
-                        
-                        repeat_type = query.data.replace('repeat_', '')
-                        if 'new_event' not in context.user_data:
-                            context.user_data['new_event'] = {}
-                        context.user_data['new_event']['repeat_type'] = repeat_type
-                        
-                        # После повторения завершаем создание события (как в задачах после регулярности завершается создание)
-                        # Используем функцию finish_event_creation из schedule_module
-                        if hasattr(schedule_module, 'finish_event_creation'):
-                            return await schedule_module.finish_event_creation(query, context)
-                        else:
-                            # Если функции нет, вызываем оригинальную add_event_repeat, которая должна завершить создание
-                            return await schedule_module.add_event_repeat(update, context)
-                    
-                    # Добавляем WAITING_REMINDER_1 если есть
-                    if WAITING_REMINDER_1 is not None:
-                        states[WAITING_REMINDER_1] = [
-                            CallbackQueryHandler(
-                                wrap_schedule_handler(add_event_reminder_1_reordered),
-                                pattern='^reminder_'
-                            )
-                        ]
-                    
-                    # ConversationHandler добавления событий из оригинального расписания
-                    # Больше не вешаем его на кнопку ➕, так как используется единый сценарий unified_add
-                    add_conv_handler = ConversationHandler(
-                        entry_points=[],
-                        states=states,
-                        fallbacks=[
-                            CommandHandler('cancel', wrap_schedule_handler(schedule_module.cancel))
-                        ],
-                        per_message=False,
-                    )
-                    application.add_handler(add_conv_handler)
-                    logger.info("✅ ConversationHandler для добавления событий зарегистрирован (без привязки к кнопке ➕)")
-                    
-                    # ConversationHandler для редактирования события
-                    WAITING_EDIT_CHOICE = schedule_module.WAITING_EDIT_CHOICE
-                    WAITING_EDIT_VALUE = schedule_module.WAITING_EDIT_VALUE
-                    
-                    edit_conv_handler = ConversationHandler(
-                        entry_points=[
-                            CallbackQueryHandler(
-                                create_schedule_wrapper(schedule_module.edit_event_start),
-                                pattern='^edit_'
-                            )
-                        ],
-                        states={
-                            WAITING_EDIT_CHOICE: [
-                                CallbackQueryHandler(
-                                    wrap_schedule_handler(schedule_module.edit_field_choice),
-                                    pattern='^edit_field_'
-                                )
-                            ],
-                            WAITING_EDIT_VALUE: [
-                                MessageHandler(
-                                    filters.TEXT & ~filters.COMMAND,
-                                    wrap_schedule_handler(schedule_module.edit_field_value)
-                                ),
-                                CallbackQueryHandler(
-                                    wrap_schedule_handler(schedule_module.edit_category_callback),
-                                    pattern='^cat_'
-                                )
-                            ],
-                        },
-                        fallbacks=[
-                            CallbackQueryHandler(
-                                wrap_schedule_handler(schedule_module.back_to_list),
-                                pattern='^back_to_list$'
-                            )
-                        ],
-                        per_message=False,
-                    )
-                    application.add_handler(edit_conv_handler)
-                    logger.info("✅ ConversationHandler для редактирования событий зарегистрирован")
-                    
-                    # ConversationHandler для управления категориями
-                    WAITING_CATEGORY_NAME = schedule_module.WAITING_CATEGORY_NAME
-                    WAITING_CATEGORY_EDIT_NAME = schedule_module.WAITING_CATEGORY_EDIT_NAME
-                    WAITING_CATEGORY_DELETE_CONFIRM = schedule_module.WAITING_CATEGORY_DELETE_CONFIRM
-                    
-                    categories_conv_handler = ConversationHandler(
-                        entry_points=[
-                            CallbackQueryHandler(
-                                create_schedule_wrapper(schedule_module.manage_categories),
-                                pattern='^manage_categories$'
-                            ),
-                            CallbackQueryHandler(
-                                create_schedule_wrapper(schedule_module.category_add_start),
-                                pattern='^category_add$'
-                            ),
-                            CallbackQueryHandler(
-                                create_schedule_wrapper(schedule_module.category_edit_list),
-                                pattern='^category_edit_list$'
-                            ),
-                            CallbackQueryHandler(
-                                create_schedule_wrapper(schedule_module.category_delete_list),
-                                pattern='^category_delete_list$'
-                            )
-                        ],
-                        states={
-                            WAITING_CATEGORY_NAME: [
-                                MessageHandler(
-                                    filters.TEXT & ~filters.COMMAND,
-                                    wrap_schedule_handler(schedule_module.category_add_name)
-                                )
-                            ],
-                            WAITING_CATEGORY_EDIT_NAME: [
-                                CallbackQueryHandler(
-                                    wrap_schedule_handler(schedule_module.category_edit_selected),
-                                    pattern='^category_edit_'
-                                ),
-                                MessageHandler(
-                                    filters.TEXT & ~filters.COMMAND,
-                                    wrap_schedule_handler(schedule_module.category_edit_name)
-                                )
-                            ],
-                            WAITING_CATEGORY_DELETE_CONFIRM: [
-                                CallbackQueryHandler(
-                                    wrap_schedule_handler(schedule_module.category_delete_confirm),
-                                    pattern='^category_delete_'
-                                ),
-                                CallbackQueryHandler(
-                                    wrap_schedule_handler(schedule_module.category_delete_yes),
-                                    pattern='^category_delete_yes_'
-                                ),
-                                CallbackQueryHandler(
-                                    wrap_schedule_handler(schedule_module.category_delete_list),
-                                    pattern='^category_delete_list$'
-                                )
-                            ],
-                        },
-                        fallbacks=[
-                            CallbackQueryHandler(
-                                wrap_schedule_handler(schedule_module.manage_categories),
-                                pattern='^manage_categories$'
-                            ),
-                            CallbackQueryHandler(
-                                wrap_schedule_handler(schedule_module.back_to_main),
-                                pattern='^back_to_main$'
-                            ),
-                            CallbackQueryHandler(
-                                wrap_schedule_handler(schedule_module.categories_done),
-                                pattern='^categories_done$'
-                            ),
-                            CallbackQueryHandler(
-                                wrap_schedule_handler(schedule_module.category_add_start),
-                                pattern='^category_add$'
-                            ),
-                            CallbackQueryHandler(
-                                wrap_schedule_handler(schedule_module.category_edit_list),
-                                pattern='^category_edit_list$'
-                            ),
-                            CallbackQueryHandler(
-                                wrap_schedule_handler(schedule_module.category_delete_list),
-                                pattern='^category_delete_list$'
-                            ),
-                            CallbackQueryHandler(
-                                wrap_schedule_handler(schedule_module.back_to_category_selection),
-                                pattern='^back_to_category_selection$'
-                            )
-                        ],
-                        per_message=False,
-                    )
-                    application.add_handler(categories_conv_handler)
-                    print("✅ ConversationHandler для управления категориями зарегистрирован")
-                    
-                except Exception as e:
-                    print(f"⚠️  Ошибка при создании ConversationHandler для расписания: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # Регистрируем основные обработчики расписания
-            # Команды (работают только в режиме расписания)
-            if hasattr(schedule_module, 'help_command'):
-                application.add_handler(CommandHandler(
-                    'help',
-                    create_schedule_wrapper(schedule_module.help_command)
-                ))
-            if hasattr(schedule_module, 'list_events'):
-                application.add_handler(CommandHandler(
-                    'list',
-                    create_schedule_wrapper(schedule_module.list_events)
-                ))
-            if hasattr(schedule_module, 'today_events'):
-                application.add_handler(CommandHandler(
-                    'today',
-                    create_schedule_wrapper(schedule_module.today_events)
-                ))
-            if hasattr(schedule_module, 'week_events'):
-                application.add_handler(CommandHandler(
-                    'week',
-                    create_schedule_wrapper(schedule_module.week_events)
-                ))
-            if hasattr(schedule_module, 'clear_messages'):
-                application.add_handler(CommandHandler(
-                    'clear',
-                    create_schedule_wrapper(schedule_module.clear_messages)
-                ))
-            
-            # Кнопки клавиатуры
-            if hasattr(schedule_module, 'tomorrow_events'):
-                application.add_handler(MessageHandler(
-                    filters.Regex('^что завтра\\?\s*$'),
-                    create_schedule_wrapper(schedule_module.tomorrow_events)
-                ))
-            if hasattr(schedule_module, 'today_events'):
-                application.add_handler(MessageHandler(
-                    filters.Regex('^что сегодня\\?\s*$'),
-                    create_schedule_wrapper(schedule_module.today_events)
-                ))
-            if hasattr(schedule_module, 'week_events'):
-                application.add_handler(MessageHandler(
-                    filters.Regex('^моё расписание\s*$'),
-                    create_schedule_wrapper(schedule_module.week_events)
-                ))
-            if hasattr(schedule_module, 'edit_events_list'):
-                application.add_handler(MessageHandler(
-                    filters.Regex('^✏️\s*$'),
-                    create_schedule_wrapper(schedule_module.edit_events_list)
-                ))
-                # Из раздела «План» можно перейти к редактированию событий/встреч
-                application.add_handler(MessageHandler(
-                    filters.Regex('^✏️ Редактировать события$'),
-                    create_schedule_wrapper(schedule_module.edit_events_list)
-                ))
-            if hasattr(schedule_module, 'clear_messages'):
-                application.add_handler(MessageHandler(
-                    filters.Regex('^🙈\s*$'),
-                    create_schedule_wrapper(schedule_module.clear_messages)
-                ))
-            
-            # Callback handlers
-            if hasattr(schedule_module, 'event_callback'):
-                application.add_handler(CallbackQueryHandler(
-                    create_schedule_wrapper(schedule_module.event_callback),
-                    pattern='^event_'
-                ))
-            if hasattr(schedule_module, 'delete_event'):
-                application.add_handler(CallbackQueryHandler(
-                    create_schedule_wrapper(schedule_module.delete_event),
-                    pattern='^delete_'
-                ))
-            if hasattr(schedule_module, 'confirm_delete_yes'):
-                application.add_handler(CallbackQueryHandler(
-                    create_schedule_wrapper(schedule_module.confirm_delete_yes),
-                    pattern='^confirm_delete_yes$'
-                ))
-            if hasattr(schedule_module, 'confirm_delete_no'):
-                application.add_handler(CallbackQueryHandler(
-                    create_schedule_wrapper(schedule_module.confirm_delete_no),
-                    pattern='^confirm_delete_no$'
-                ))
-            if hasattr(schedule_module, 'confirm_delete_start'):
-                application.add_handler(CallbackQueryHandler(
-                    create_schedule_wrapper(schedule_module.confirm_delete_start),
-                    pattern='^confirm_delete_start$'
-                ))
-            if hasattr(schedule_module, 'back_to_list'):
-                application.add_handler(CallbackQueryHandler(
-                    create_schedule_wrapper(schedule_module.back_to_list),
-                    pattern='^back_to_list$'
-                ))
-            if hasattr(schedule_module, 'back_to_main'):
-                application.add_handler(CallbackQueryHandler(
-                    create_schedule_wrapper(schedule_module.back_to_main),
-                    pattern='^back_to_main$'
-                ))
-            if hasattr(schedule_module, 'show_help'):
-                application.add_handler(CallbackQueryHandler(
-                    create_schedule_wrapper(schedule_module.show_help),
-                    pattern='^show_help$'
-                ))
-            if hasattr(schedule_module, 'clear_chat_callback'):
-                application.add_handler(CallbackQueryHandler(
-                    create_schedule_wrapper(schedule_module.clear_chat_callback),
-                    pattern='^clear_chat$'
-                ))
-            if hasattr(schedule_module, 'categories_done'):
-                application.add_handler(CallbackQueryHandler(
-                    create_schedule_wrapper(schedule_module.categories_done),
-                    pattern='^categories_done$'
-                ))
-            
-            logger.info("✅ Обработчики расписания зарегистрированы")
-        except Exception as e:
-            logger.error(f"Ошибка при регистрации обработчиков расписания: {e}", exc_info=True)
-    
-    # Регистрируем обработчики из бота задач (если модуль загружен)
-    # ConversationHandler для задач тоже должен быть зарегистрирован рано
-    if tasks_module:
-        try:
-            # Переопределяем get_main_keyboard в модуле задач глобально для unified_bot
-            # Это гарантирует, что все функции завершения будут использовать правильную клавиатуру
-            if hasattr(tasks_module, 'get_main_keyboard'):
-                tasks_module.get_main_keyboard = get_tasks_keyboard
-                logger.info("✅ get_main_keyboard переопределен для раздела задач")
-            
-            # Переопределяем rename_user_project, чтобы она также обновляла события в расписании
-            if schedule_module:
-                original_rename_project = tasks_module.rename_user_project
-                def rename_user_project_unified(user_id: str, old_name: str, new_name: str):
-                    """Переименование проекта с обновлением событий"""
-                    try:
-                        result = original_rename_project(user_id, old_name, new_name)
-                        if result and schedule_module and hasattr(schedule_module, 'get_user_events'):
-                            try:
-                                events = schedule_module.get_user_events(str(user_id))
-                                if isinstance(events, list):
-                                    updated = False
-                                    for event in events:
-                                        if isinstance(event, dict) and event.get('category') == old_name:
-                                            event['category'] = new_name
-                                            updated = True
-                                    
-                                    if updated and hasattr(schedule_module, 'update_user_event'):
-                                        # Сохраняем обновленные события через update_user_event
-                                        for event in events:
-                                            if isinstance(event, dict) and event.get('category') == new_name and 'id' in event:
-                                                schedule_module.update_user_event(str(user_id), event['id'], event)
-                            except Exception as e:
-                                logger.error(f"Ошибка при обновлении событий при переименовании проекта: {e}", exc_info=True)
-                        return result
-                    except Exception as e:
-                        logger.error(f"Ошибка при переименовании проекта '{old_name}' -> '{new_name}' для пользователя {user_id}: {e}", exc_info=True)
-                        return False
-                tasks_module.rename_user_project = rename_user_project_unified
-                logger.info("✅ rename_user_project переопределена для обновления событий")
-            
-            # Используем обертки из модуля wrappers
-            
-            # ConversationHandler для добавления задачи
-            if (hasattr(tasks_module, 'add_task_start') and 
-                hasattr(tasks_module, 'WAITING_TASK_TITLE')):
-                try:
-                    WAITING_TASK_TITLE = tasks_module.WAITING_TASK_TITLE
-                    WAITING_TASK_COMMENT = tasks_module.WAITING_TASK_COMMENT
-                    WAITING_TASK_PROJECT = tasks_module.WAITING_TASK_PROJECT
-                    WAITING_TASK_DEADLINE = tasks_module.WAITING_TASK_DEADLINE
-                    WAITING_TASK_REMINDER = tasks_module.WAITING_TASK_REMINDER
-                    WAITING_TASK_RECURRENCE = tasks_module.WAITING_TASK_RECURRENCE
-                    # новое состояние для выбора категории
-                    WAITING_TASK_CATEGORY = getattr(tasks_module, 'WAITING_TASK_CATEGORY', None)
-                    
-                    # Используем обертки из модуля wrappers
-                    
-                    add_task_conv_handler = ConversationHandler(
-                        entry_points=[
-                            MessageHandler(
-                                filters.Regex('^➕\s*$') & ~filters.COMMAND,
-                                create_tasks_entry_wrapper(tasks_module.add_task_start)
-                            )
-                        ],
-                        states={
-                            WAITING_TASK_TITLE: [
-                                MessageHandler(
-                                    (filters.TEXT | filters.VOICE) & ~filters.COMMAND,
-                                    wrap_tasks_handler(tasks_module.add_task_title)
-                                )
-                            ],
-                            WAITING_TASK_COMMENT: [
-                                CommandHandler('skip', wrap_tasks_handler(tasks_module.add_task_comment)),
-                                MessageHandler(
-                                    filters.TEXT & ~filters.COMMAND,
-                                    wrap_tasks_handler(tasks_module.add_task_comment)
-                                ),
-                                MessageHandler(
-                                    filters.VOICE,
-                                    wrap_tasks_handler(tasks_module.add_task_comment)
-                                )
-                            ],
-                            WAITING_TASK_PROJECT: [
-                                CallbackQueryHandler(
-                                    wrap_tasks_handler(tasks_module.add_task_project_callback),
-                                    pattern='^project_|^new_project|^skip_project'
-                                ),
-                                MessageHandler(
-                                    filters.TEXT & ~filters.COMMAND,
-                                    wrap_tasks_handler(tasks_module.add_task_project_text)
-                                )
-                            ],
-                            WAITING_TASK_DEADLINE: [
-                                MessageHandler(
-                                    (filters.TEXT | filters.VOICE) & ~filters.COMMAND,
-                                    wrap_tasks_handler(tasks_module.add_task_deadline)
-                                ),
-                                CommandHandler('skip', wrap_tasks_handler(tasks_module.add_task_deadline))
-                            ],
-                            WAITING_TASK_REMINDER: [
-                                CallbackQueryHandler(
-                                    wrap_tasks_handler(tasks_module.add_task_reminder_callback),
-                                    pattern='^reminder_|^skip_reminder'
-                                ),
-                                MessageHandler(
-                                    filters.TEXT & ~filters.COMMAND,
-                                    wrap_tasks_handler(tasks_module.add_task_reminder)
-                                ),
-                                CommandHandler('skip', wrap_tasks_handler(tasks_module.add_task_reminder))
-                            ],
-                            WAITING_TASK_RECURRENCE: [
-                                CallbackQueryHandler(
-                                    wrap_tasks_handler(tasks_module.add_task_recurrence_callback),
-                                    pattern='^recurrence_'
-                                )
-                            ],
-                            **(
-                                {
-                                    WAITING_TASK_CATEGORY: [
-                                        CallbackQueryHandler(
-                                            wrap_tasks_handler(tasks_module.add_task_category_callback),
-                                            pattern='^task_category_'
-                                        )
-                                    ]
-                                } if WAITING_TASK_CATEGORY is not None else {}
-                            ),
-                        },
-                        fallbacks=[CommandHandler('cancel', wrap_tasks_handler(tasks_module.cancel))],
-                        per_message=False,
-                        per_chat=True,
-                    )
-                    application.add_handler(add_task_conv_handler)
-                    logger.info("✅ ConversationHandler для добавления задач зарегистрирован")
-                    
-                    # ConversationHandler для добавления проекта
-                    WAITING_PROJECT_NAME = tasks_module.WAITING_PROJECT_NAME
-                    WAITING_PROJECT_TYPE = tasks_module.WAITING_PROJECT_TYPE
-                    WAITING_PROJECT_TARGET_TASKS = tasks_module.WAITING_PROJECT_TARGET_TASKS
-                    WAITING_PROJECT_PRIORITY = tasks_module.WAITING_PROJECT_PRIORITY
-                    WAITING_PROJECT_END_DATE = tasks_module.WAITING_PROJECT_END_DATE
-                    
-                    # Используем обертки из модуля wrappers
-                    
-                    add_project_conv_handler = ConversationHandler(
-                        entry_points=[
-                            CallbackQueryHandler(
-                                create_add_project_wrapper(tasks_module.add_project_start_callback),
-                                pattern='^add_project$'
-                            )
-                        ],
-                        states={
-                            WAITING_PROJECT_NAME: [
-                                MessageHandler(
-                                    filters.TEXT & ~filters.COMMAND,
-                                    wrap_tasks_handler(tasks_module.add_project_name)
-                                )
-                            ],
-                            WAITING_PROJECT_TYPE: [
-                                CallbackQueryHandler(
-                                    wrap_tasks_handler(tasks_module.add_project_type_callback),
-                                    pattern='^project_type_'
-                                )
-                            ],
-                            WAITING_PROJECT_TARGET_TASKS: [
-                                MessageHandler(
-                                    filters.TEXT & ~filters.COMMAND,
-                                    wrap_tasks_handler(tasks_module.add_project_target_tasks)
-                                )
-                            ],
-                            WAITING_PROJECT_PRIORITY: [
-                                CallbackQueryHandler(
-                                    wrap_tasks_handler(tasks_module.add_project_priority_callback),
-                                    pattern='^project_priority_'
-                                )
-                            ],
-                            WAITING_PROJECT_END_DATE: [
-                                MessageHandler(
-                                    filters.TEXT & ~filters.COMMAND,
-                                    wrap_tasks_handler(tasks_module.add_project_end_date)
-                                ),
-                                CallbackQueryHandler(
-                                    wrap_tasks_handler(tasks_module.add_project_end_date),
-                                    pattern='^project_end_date_'
-                                )
-                            ],
-                        },
-                        fallbacks=[CommandHandler('cancel', wrap_tasks_handler(tasks_module.cancel))],
-                        per_message=False,
-                        per_chat=True,
-                    )
-                    application.add_handler(add_project_conv_handler)
-                    logger.info("✅ ConversationHandler для добавления проектов зарегистрирован")
-                    
-                    # ConversationHandler для обработки выполнения задач
-                    WAITING_TASK_COMPLETE_CONFIRM = tasks_module.WAITING_TASK_COMPLETE_CONFIRM
-                    WAITING_TASK_RESCHEDULE = tasks_module.WAITING_TASK_RESCHEDULE
-                    
-                    task_complete_conv_handler = ConversationHandler(
-                        entry_points=[
-                            CallbackQueryHandler(
-                                create_tasks_wrapper(tasks_module.task_complete_callback),
-                                pattern='^task_complete_'
-                            )
-                        ],
-                        states={
-                            WAITING_TASK_COMPLETE_CONFIRM: [
-                                CallbackQueryHandler(
-                                    wrap_tasks_handler(tasks_module.task_confirm_callback),
-                                    pattern='^task_confirm_'
-                                )
-                            ],
-                            WAITING_TASK_RESCHEDULE: [
-                                MessageHandler(
-                                    (filters.TEXT | filters.VOICE) & ~filters.COMMAND,
-                                    wrap_tasks_handler(tasks_module.task_reschedule)
-                                )
-                            ],
-                        },
-                        fallbacks=[CommandHandler('cancel', wrap_tasks_handler(tasks_module.cancel))],
-                        per_message=False,
-                        per_chat=True,
-                        per_user=True,
-                    )
-                    application.add_handler(task_complete_conv_handler)
-                    logger.info("✅ ConversationHandler для выполнения задач зарегистрирован")
-                    
-                    # ConversationHandler для редактирования задач
-                    WAITING_EDIT_TASK_SELECT = tasks_module.WAITING_EDIT_TASK_SELECT
-                    WAITING_EDIT_FIELD_SELECT = tasks_module.WAITING_EDIT_FIELD_SELECT
-                    WAITING_EDIT_TITLE = tasks_module.WAITING_EDIT_TITLE
-                    WAITING_EDIT_COMMENT = tasks_module.WAITING_EDIT_COMMENT
-                    WAITING_EDIT_PROJECT = tasks_module.WAITING_EDIT_PROJECT
-                    WAITING_EDIT_DEADLINE = tasks_module.WAITING_EDIT_DEADLINE
-                    WAITING_EDIT_REMINDER = tasks_module.WAITING_EDIT_REMINDER
-                    WAITING_EDIT_RECURRENCE = tasks_module.WAITING_EDIT_RECURRENCE
-                    
-                    edit_task_conv_handler = ConversationHandler(
-                        entry_points=[
-                            MessageHandler(
-                                filters.Regex('^✏️\s*$'),
-                                create_tasks_entry_wrapper(tasks_module.edit_task_start)
-                            )
-                        ],
-                        states={
-                            WAITING_EDIT_TASK_SELECT: [
-                                CallbackQueryHandler(
-                                    wrap_tasks_handler(tasks_module.edit_task_select_callback),
-                                    pattern='^edit_task_'
-                                )
-                            ],
-                            WAITING_EDIT_FIELD_SELECT: [
-                                CallbackQueryHandler(
-                                    wrap_tasks_handler(tasks_module.edit_field_select_callback),
-                                    pattern='^edit_field_|^edit_cancel$'
-                                )
-                            ],
-                            WAITING_EDIT_TITLE: [
-                                MessageHandler(
-                                    (filters.TEXT | filters.VOICE) & ~filters.COMMAND,
-                                    wrap_tasks_handler(tasks_module.edit_task_title)
-                                )
-                            ],
-                            WAITING_EDIT_COMMENT: [
-                                MessageHandler(
-                                    (filters.TEXT | filters.VOICE) & ~filters.COMMAND,
-                                    wrap_tasks_handler(tasks_module.edit_task_comment)
-                                ),
-                                CommandHandler('skip', wrap_tasks_handler(tasks_module.edit_task_comment))
-                            ],
-                            WAITING_EDIT_PROJECT: [
-                                CallbackQueryHandler(
-                                    wrap_tasks_handler(tasks_module.edit_task_project_callback),
-                                    pattern='^edit_project_task_|^edit_cancel$'
-                                )
-                            ],
-                            WAITING_EDIT_DEADLINE: [
-                                MessageHandler(
-                                    (filters.TEXT | filters.VOICE) & ~filters.COMMAND,
-                                    wrap_tasks_handler(tasks_module.edit_task_deadline)
-                                ),
-                                CommandHandler('skip', wrap_tasks_handler(tasks_module.edit_task_deadline))
-                            ],
-                            WAITING_EDIT_REMINDER: [
-                                CallbackQueryHandler(
-                                    wrap_tasks_handler(tasks_module.edit_task_reminder_callback),
-                                    pattern='^edit_reminder_|^edit_cancel$'
-                                )
-                            ],
-                            WAITING_EDIT_RECURRENCE: [
-                                CallbackQueryHandler(
-                                    wrap_tasks_handler(tasks_module.edit_task_recurrence_callback),
-                                    pattern='^edit_recurrence_|^edit_cancel$'
-                                )
-                            ],
-                        },
-                        fallbacks=[CommandHandler('cancel', wrap_tasks_handler(tasks_module.cancel))],
-                        per_message=False,
-                        per_chat=True,
-                        per_user=True,
-                    )
-                    application.add_handler(edit_task_conv_handler)
-                    logger.info("✅ ConversationHandler для редактирования задач зарегистрирован")
-                    
-                    # ConversationHandler для редактирования проекта
-                    WAITING_EDIT_PROJECT_TARGET_TASKS = tasks_module.WAITING_EDIT_PROJECT_TARGET_TASKS
-                    WAITING_EDIT_PROJECT_NAME = tasks_module.WAITING_EDIT_PROJECT_NAME
-                    
-                    # Используем обертки из модуля wrappers
-                    
-                    project_edit_conv_handler = ConversationHandler(
-                        entry_points=[
-                            CallbackQueryHandler(
-                                create_edit_project_wrapper(tasks_module.edit_project_name_start),
-                                pattern='^edit_project_name_'
-                            ),
-                            CallbackQueryHandler(
-                                create_edit_project_wrapper(tasks_module.edit_project_start),
-                                pattern='^edit_project_(?!name_|task_)'  # Не начинается с 'name_' или 'task_'
-                            )
-                        ],
-                        states={
-                            WAITING_EDIT_PROJECT_TARGET_TASKS: [
-                                MessageHandler(
-                                    filters.TEXT & ~filters.COMMAND & ~filters.Regex('^Статистика$|^Проекты$|^➕\s*$|^✏️\s*$|^🏠 Главное меню$'),
-                                    wrap_tasks_handler(tasks_module.edit_project_target_tasks)
-                                )
-                            ],
-                            WAITING_EDIT_PROJECT_NAME: [
-                                MessageHandler(
-                                    filters.TEXT & ~filters.COMMAND & ~filters.Regex('^Статистика$|^Проекты$|^➕\s*$|^✏️\s*$|^🏠 Главное меню$'),
-                                    wrap_tasks_handler(tasks_module.edit_project_name)
-                                )
-                            ],
-                        },
-                        fallbacks=[
-                            CommandHandler('cancel', wrap_tasks_handler(tasks_module.cancel)),
-                            MessageHandler(
-                                filters.Regex('^Статистика$|^Проекты$|^➕\s*$|^✏️\s*$|^🏠 Главное меню$'),
-                                end_conversation_handler
-                            )
-                        ],
-                        per_message=False,
-                        per_chat=True,
-                        per_user=True,
-                    )
-                    application.add_handler(project_edit_conv_handler)
-                    logger.info("✅ ConversationHandler для редактирования проектов зарегистрирован")
-                    
-                    # ConversationHandler для подтверждения готовности проекта
-                    WAITING_PROJECT_COMPLETE_CONFIRM = tasks_module.WAITING_PROJECT_COMPLETE_CONFIRM
-                    
-                    project_complete_conv_handler = ConversationHandler(
-                        entry_points=[
-                            CallbackQueryHandler(
-                                create_tasks_wrapper(tasks_module.project_complete_start),
-                                pattern='^project_complete_'
-                            )
-                        ],
-                        states={
-                            WAITING_PROJECT_COMPLETE_CONFIRM: [
-                                CallbackQueryHandler(
-                                    wrap_tasks_handler(tasks_module.project_complete_confirm),
-                                    pattern='^project_complete_yes$|^project_complete_no$'
-                                )
-                            ],
-                        },
-                        fallbacks=[
-                            CommandHandler('cancel', wrap_tasks_handler(tasks_module.cancel)),
-                            MessageHandler(
-                                filters.Regex('^Статистика$|^Проекты$|^➕\s*$|^✏️\s*$|^🏠 Главное меню$'),
-                                end_conversation_handler
-                            )
-                        ],
-                        per_message=False,
-                        per_chat=True,
-                        per_user=True,
-                    )
-                    application.add_handler(project_complete_conv_handler)
-                    logger.info("✅ ConversationHandler для подтверждения готовности проекта зарегистрирован")
-                    
-                except Exception as e:
-                    print(f"⚠️  Ошибка при создании ConversationHandler для задач: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # Регистрируем основные обработчики задач
-            # Команды (работают только в режиме задач)
-            if hasattr(tasks_module, 'help_command'):
-                application.add_handler(CommandHandler(
-                    'help',
-                    create_tasks_wrapper(tasks_module.help_command)
-                ))
-            if hasattr(tasks_module, 'list_tasks'):
-                application.add_handler(CommandHandler(
-                    'list',
-                    create_tasks_wrapper(tasks_module.list_tasks)
-                ))
-            if hasattr(tasks_module, 'projects_list'):
-                application.add_handler(CommandHandler(
-                    'projects',
-                    create_tasks_wrapper(tasks_module.projects_list)
-                ))
-            if hasattr(tasks_module, 'stats_menu'):
-                application.add_handler(CommandHandler(
-                    'stats',
-                    create_tasks_wrapper(tasks_module.stats_menu)
-                ))
-            
-            # Callback handlers для задач
-            if hasattr(tasks_module, 'schedule_callback'):
-                application.add_handler(CallbackQueryHandler(
-                    create_tasks_wrapper(tasks_module.schedule_callback),
-                    pattern='^schedule_'
-                ))
-            if hasattr(tasks_module, 'project_info_callback'):
-                # Обработчик для проектов - работает из любого режима (включая главное меню)
-                async def project_info_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    # Временно устанавливаем режим задач для корректной работы функции
-                    old_mode = context.user_data.get('bot_mode', MODE_MAIN)
-                    context.user_data['bot_mode'] = MODE_TASKS
-                    try:
-                        result = await tasks_module.project_info_callback(update, context)
-                        return result
-                    finally:
-                        # Возвращаем режим обратно только если ConversationHandler не активен
-                        if not context.user_data.get('_conversation_active'):
-                            context.user_data['bot_mode'] = old_mode
-                
-                application.add_handler(CallbackQueryHandler(
-                    project_info_wrapper,
-                    pattern='^project_info_|^projects_list$|^projects_summary$|^project_tasks_|^edit_projects_list$|^add_project$'
-                ))
-            if hasattr(tasks_module, 'projects_list_callback'):
-                # Обработчик для списка проектов - работает из любого режима
-                async def projects_list_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    old_mode = context.user_data.get('bot_mode', MODE_MAIN)
-                    context.user_data['bot_mode'] = MODE_TASKS
-                    try:
-                        return await tasks_module.projects_list_callback(update, context)
-                    finally:
-                        context.user_data['bot_mode'] = old_mode
-                
-                application.add_handler(CallbackQueryHandler(
-                    projects_list_wrapper,
-                    pattern='^projects_list_callback$'
-                ))
-            
-            logger.info("✅ Обработчики задач зарегистрированы")
-        except Exception as e:
-            logger.error(f"Ошибка при регистрации обработчиков задач: {e}", exc_info=True)
-    
-    # Функция для показа статистики из главного меню
-    async def show_statistics_from_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать статистику из главного меню"""
-        try:
-            if not update.message:
-                logger.warning("show_statistics_from_main вызван без сообщения")
-                return
-            
-            tasks_module = context.application.bot_data.get('tasks_module')
-            if tasks_module and hasattr(tasks_module, 'show_projects_summary_from_menu'):
-                # Временно устанавливаем режим задач для корректной работы функции
-                old_mode = context.user_data.get('bot_mode', MODE_MAIN)
-                context.user_data['bot_mode'] = MODE_TASKS
-                try:
-                    await tasks_module.show_projects_summary_from_menu(update, context)
-                except Exception as e:
-                    logger.error(f"Ошибка при показе статистики: {e}", exc_info=True)
-                    await update.message.reply_text(
-                        "❌ Ошибка при загрузке статистики",
-                        reply_markup=get_unified_main_keyboard()
-                    )
-                finally:
-                    # Возвращаем режим обратно
-                    context.user_data['bot_mode'] = old_mode
-            else:
-                await update.message.reply_text(
-                    "❌ Статистика недоступна",
-                    reply_markup=get_unified_main_keyboard()
-                )
-        except Exception as e:
-            logger.error(f"Ошибка в show_statistics_from_main: {e}", exc_info=True)
-            try:
-                if update.message:
-                    await update.message.reply_text(
-                        "❌ Ошибка при обработке запроса",
-                        reply_markup=get_unified_main_keyboard()
-                    )
-            except Exception:
-                pass
-    
-    # Главное меню - обработчики
-    application.add_handler(CommandHandler('start', unified_start))
-    application.add_handler(MessageHandler(filters.Regex('^Проекты$'), show_projects))  # Общий обработчик для всех режимов
-    application.add_handler(MessageHandler(filters.Regex('^Статистика$'), show_statistics_from_main))  # Статистика из главного меню
-    
-    # Специальная команда для очистки истории переписки и данных по пользователю
-    async def clear_user_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Очищает все данные пользователя (задачи, события, проекты, кеш сообщений) по триггеру 👨🏿‍🔬"""
-        user_id = str(update.effective_user.id) if update.effective_user else None
-        if not user_id:
-            return
-        
-        # Очищаем данные задач/проектов в tasks_data.json
-        try:
-            tasks_path = str(DATA_DIR / 'tasks_data.json')
-            if os.path.exists(tasks_path):
-                # Загружаем текущие данные
-                with open(tasks_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                users = data.get('users', {})
-                if user_id in users:
-                    users[user_id]['tasks'] = []
-                    users[user_id]['projects'] = []
-                    users[user_id]['tags'] = []
-                    users[user_id]['projects_data'] = {}
-                data['users'] = users
-
-                # Делаем .bak перед перезаписью
-                import shutil as _shutil
-                backup_path = f"{tasks_path}.bak"
-                try:
-                    _shutil.copy2(tasks_path, backup_path)
-                except Exception:
-                    pass
-
-                with open(tasks_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"Ошибка очистки tasks_data.json для пользователя {user_id}: {e}", exc_info=True)
-        
-        # Очищаем события в schedule_data.json
-        try:
-            schedule_path = str(DATA_DIR / 'schedule_data.json')
-            if os.path.exists(schedule_path):
-                with open(schedule_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                if user_id in data:
-                    data[user_id] = []
-
-                # Бэкап перед перезаписью
-                import shutil as _shutil
-                backup_path = f"{schedule_path}.bak"
-                try:
-                    _shutil.copy2(schedule_path, backup_path)
-                except Exception:
-                    pass
-
-                with open(schedule_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"Ошибка очистки schedule_data.json для пользователя {user_id}: {e}", exc_info=True)
-        
-        # Очищаем shared_projects.json (совместные проекты)
-        try:
-            shared_path = str(DATA_DIR / 'shared_projects.json')
-            if os.path.exists(shared_path):
-                with open(shared_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                if user_id in data:
-                    data[user_id] = {}
-
-                # Бэкап перед перезаписью
-                import shutil as _shutil
-                backup_path = f"{shared_path}.bak"
-                try:
-                    _shutil.copy2(shared_path, backup_path)
-                except Exception:
-                    pass
-
-                with open(shared_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"Ошибка очистки shared_projects.json для пользователя {user_id}: {e}", exc_info=True)
-        
-        # Очищаем вспомогательные файлы с сообщениями (если есть)
-        try:
-            for path in [
-                str(DATA_DIR / 'user_messages.json'),
-                str(DATA_DIR / 'user_sent_messages.json')
-            ]:
-                if os.path.exists(path):
-                    try:
-                        with open(path, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                        if isinstance(data, dict) and user_id in data:
-                            data.pop(user_id, None)
-                            # Бэкап перед перезаписью
-                            import shutil as _shutil
-                            backup_path = f"{path}.bak"
-                            try:
-                                _shutil.copy2(path, backup_path)
-                            except Exception:
-                                pass
-
-                            with open(path, 'w', encoding='utf-8') as f:
-                                json.dump(data, f, ensure_ascii=False, indent=2)
-                    except Exception:
-                        # В крайнем случае просто очищаем файл
-                        with open(path, 'w', encoding='utf-8') as f:
-                            f.write('{}')
-        except Exception as e:
-            logger.error(f"Ошибка очистки файлов сообщений для пользователя {user_id}: {e}", exc_info=True)
-        
-        # Сообщаем пользователю
-        await update.message.reply_text(
-            "🧼 Вся история дел (задачи, события, проекты пользователя) и кеш переписки на стороне бота очищены.",
-            reply_markup=get_main_keyboard()
-        )
-    
-    # Триггер по эмодзи 👨🏿‍🔬 для полной очистки истории
-    application.add_handler(
-        MessageHandler(filters.Regex('^👨🏿‍🔬$') & ~filters.COMMAND, clear_user_history)
-    )
-    application.add_handler(MessageHandler(filters.Regex('^📋 План$'), switch_to_plan))
-    application.add_handler(MessageHandler(filters.Regex('^🏠 Главное меню$'), back_to_main_menu))
-    
-    # Обработчики планов
-    application.add_handler(MessageHandler(filters.Regex('^📅 План на сегодня$'), show_plan_today))
-    application.add_handler(MessageHandler(filters.Regex('^📅 План на завтра$'), show_plan_tomorrow))
-    application.add_handler(MessageHandler(filters.Regex('^📅 План на неделю$'), show_plan_week))
-    application.add_handler(MessageHandler(filters.Regex('^📅 План на месяц$'), show_plan_month))
-    application.add_handler(MessageHandler(filters.Regex('^📅 План на год$'), show_plan_year))
-    application.add_handler(MessageHandler(filters.Regex('^📅 План на 3 года$'), show_plan_3years))
-    application.add_handler(MessageHandler(filters.Regex('^✅ Управление задачами$'), show_tasks_management_from_plan))
-    
-    # Обработчики для управления задачами из плана
-    async def plan_task_complete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка нажатия на задачу из плана"""
-        try:
-            query = update.callback_query
-            if not query:
-                logger.warning("plan_task_complete_callback вызван без callback_query")
-                return
-            
-            await query.answer()
-            
-            # Извлекаем task_id из callback_data
-            task_id = query.data.replace("plan_task_complete_", "")
-            
-            tasks_module = context.application.bot_data.get('tasks_module')
-            if not tasks_module:
-                await query.edit_message_text("❌ Модуль задач недоступен")
-                return
-            
-            user_id = query.from_user.id
-            
-            # Получаем задачу
-            task = None
-            if hasattr(tasks_module, 'get_user_task_by_id'):
-                try:
-                    task = tasks_module.get_user_task_by_id(str(user_id), task_id)
-                except Exception as e:
-                    logger.error(f"Ошибка при получении задачи по ID: {e}", exc_info=True)
-            
-            if not task and hasattr(tasks_module, 'get_user_tasks'):
-                try:
-                    tasks = tasks_module.get_user_tasks(str(user_id))
-                    if isinstance(tasks, list):
-                        task = next((t for t in tasks if isinstance(t, dict) and t.get('id') == task_id), None)
-                except Exception as e:
-                    logger.error(f"Ошибка при получении списка задач: {e}", exc_info=True)
-            
-            if not task:
-                await query.answer("Задача не найдена", show_alert=True)
-                return
-            
-            if not isinstance(task, dict):
-                logger.error(f"Задача не является словарем: {type(task)}")
-                await query.answer("Ошибка: неверный формат задачи", show_alert=True)
-                return
-            
-            completed = task.get('completed', False)
-            task_title = task.get('title', 'Без названия')
-            deadline = task.get('deadline', '')
-            deadline_str = ''
-            if deadline:
-                try:
-                    if 'T' in deadline:
-                        deadline_dt = datetime.fromisoformat(deadline.replace('Z', '+00:00'))
-                        deadline_str = deadline_dt.strftime('%d.%m %H:%M')
-                    else:
-                        deadline_dt = datetime.strptime(deadline, '%Y-%m-%d')
-                        deadline_str = deadline_dt.strftime('%d.%m')
-                except Exception:
-                    pass
-            
-            # Меню задачи: Выполнить / Редактировать / Удалить / Назад
-            if completed:
-                keyboard = [
-                    [InlineKeyboardButton("↩️ Отметить как невыполненную", callback_data=f"plan_task_uncomplete_{task_id}")],
-                    [InlineKeyboardButton("✏️ Редактировать", callback_data=f"plan_task_edit_{task_id}"), InlineKeyboardButton("🗑 Удалить", callback_data=f"plan_task_delete_{task_id}")],
-                    [InlineKeyboardButton("◀️ Назад к списку", callback_data="plan_back_to_tasks")]
-                ]
-            else:
-                keyboard = [
-                    [InlineKeyboardButton("✅ Выполнить", callback_data=f"plan_task_do_complete_{task_id}")],
-                    [InlineKeyboardButton("✏️ Редактировать", callback_data=f"plan_task_edit_{task_id}"), InlineKeyboardButton("🗑 Удалить", callback_data=f"plan_task_delete_{task_id}")],
-                    [InlineKeyboardButton("◀️ Назад к списку", callback_data="plan_back_to_tasks")]
-                ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            task_info = f"<b>{task_title}</b>"
-            if deadline_str:
-                task_info += f" ({deadline_str})"
-            await query.edit_message_text(
-                f"Задача: {task_info}\n\nЧто сделать?",
-                parse_mode='HTML',
-                reply_markup=reply_markup
-            )
-        except Exception as e:
-            logger.error(f"Ошибка в plan_task_complete_callback: {e}", exc_info=True)
-            try:
-                if update.callback_query:
-                    await update.callback_query.answer("❌ Произошла ошибка", show_alert=True)
-            except Exception:
-                pass
-    
-    async def plan_task_do_complete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Кнопка «Выполнить» — показать подтверждение"""
-        try:
-            query = update.callback_query
-            if not query:
-                return
-            await query.answer()
-            task_id = query.data.replace("plan_task_do_complete_", "")
-            user_id = query.from_user.id
-            tasks_module = context.application.bot_data.get('tasks_module')
-            if not tasks_module:
-                await query.edit_message_text("❌ Модуль задач недоступен")
-                return
-            task = None
-            if hasattr(tasks_module, 'get_user_task_by_id'):
-                try:
-                    task = tasks_module.get_user_task_by_id(str(user_id), task_id)
-                except Exception:
-                    pass
-            if not task and hasattr(tasks_module, 'get_user_tasks'):
-                tasks = tasks_module.get_user_tasks(str(user_id))
-                if isinstance(tasks, list):
-                    task = next((t for t in tasks if isinstance(t, dict) and t.get('id') == task_id), None)
-            if not task:
-                await query.answer("Задача не найдена", show_alert=True)
-                return
-            context.user_data['from_plan'] = True
-            context.user_data['task_id'] = task_id
-            context.user_data['task_title'] = task.get('title', 'Без названия')
-            keyboard = [
-                [InlineKeyboardButton("Да", callback_data="plan_task_confirm_yes")],
-                [InlineKeyboardButton("Нет", callback_data="plan_task_confirm_no")]
-            ]
-            await query.edit_message_text(
-                f"Задача: <b>{context.user_data['task_title']}</b>\n\nГотово?",
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        except Exception as e:
-            logger.error(f"Ошибка в plan_task_do_complete_callback: {e}", exc_info=True)
-            try:
-                if update.callback_query:
-                    await update.callback_query.answer("❌ Ошибка", show_alert=True)
-            except Exception:
-                pass
-    
-    async def plan_task_confirm_yes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Подтверждение выполнения задачи из плана"""
-        try:
-            query = update.callback_query
-            if not query:
-                logger.warning("plan_task_confirm_yes_callback вызван без callback_query")
-                return
-            
-            await query.answer()
-            
-            task_id = context.user_data.get('task_id')
-            task_title = context.user_data.get('task_title', '')
-            user_id = query.from_user.id
-            
-            if not task_id:
-                logger.warning(f"task_id не найден в user_data для пользователя {user_id}")
-                await query.edit_message_text("❌ Ошибка: ID задачи не найден")
-                return
-            
-            tasks_module = context.application.bot_data.get('tasks_module')
-            if not tasks_module:
-                await query.edit_message_text("❌ Модуль задач недоступен")
-                return
-            
-            # Помечаем задачу как выполненную
-            if hasattr(tasks_module, 'update_user_task'):
-                try:
-                    tasks_module.update_user_task(str(user_id), task_id, {'completed': True})
-                except Exception as e:
-                    logger.error(f"Ошибка при обновлении задачи: {e}", exc_info=True)
-                    await query.edit_message_text("❌ Ошибка при обновлении задачи")
-                    return
-            
-            await query.edit_message_text(
-                f"✅ Задача <b>{task_title}</b> выполнена!",
-                parse_mode='HTML'
-            )
-            
-            # Обновляем список задач
-            await show_tasks_management_from_plan_callback(query, context)
-        except Exception as e:
-            logger.error(f"Ошибка в plan_task_confirm_yes_callback: {e}", exc_info=True)
-            try:
-                if update.callback_query:
-                    await update.callback_query.answer("❌ Произошла ошибка", show_alert=True)
-            except Exception:
-                pass
-    
-    async def plan_task_confirm_no_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Отмена выполнения задачи из плана"""
-        try:
-            query = update.callback_query
-            if not query:
-                logger.warning("plan_task_confirm_no_callback вызван без callback_query")
-                return
-            
-            await query.answer()
-            
-            # Возвращаемся к списку задач
-            await show_tasks_management_from_plan_callback(query, context)
-        except Exception as e:
-            logger.error(f"Ошибка в plan_task_confirm_no_callback: {e}", exc_info=True)
-            try:
-                if update.callback_query:
-                    await update.callback_query.answer("❌ Произошла ошибка", show_alert=True)
-            except Exception:
-                pass
-    
-    async def plan_task_uncomplete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Отметка задачи как невыполненной из плана"""
-        try:
-            query = update.callback_query
-            if not query:
-                logger.warning("plan_task_uncomplete_callback вызван без callback_query")
-                return
-            
-            await query.answer()
-            
-            task_id = query.data.replace("plan_task_uncomplete_", "")
-            user_id = query.from_user.id
-            
-            tasks_module = context.application.bot_data.get('tasks_module')
-            if not tasks_module:
-                await query.edit_message_text("❌ Модуль задач недоступен")
-                return
-            
-            # Получаем задачу для получения названия
-            task = None
-            if hasattr(tasks_module, 'get_user_task_by_id'):
-                try:
-                    task = tasks_module.get_user_task_by_id(str(user_id), task_id)
-                except Exception as e:
-                    logger.error(f"Ошибка при получении задачи по ID: {e}", exc_info=True)
-            
-            if not task and hasattr(tasks_module, 'get_user_tasks'):
-                try:
-                    tasks = tasks_module.get_user_tasks(str(user_id))
-                    if isinstance(tasks, list):
-                        task = next((t for t in tasks if isinstance(t, dict) and t.get('id') == task_id), None)
-                except Exception as e:
-                    logger.error(f"Ошибка при получении списка задач: {e}", exc_info=True)
-            
-            task_title = task.get('title', 'Без названия') if isinstance(task, dict) else 'Задача'
-            
-            # Помечаем задачу как невыполненную
-            if hasattr(tasks_module, 'update_user_task'):
-                try:
-                    tasks_module.update_user_task(str(user_id), task_id, {'completed': False})
-                except Exception as e:
-                    logger.error(f"Ошибка при обновлении задачи: {e}", exc_info=True)
-                    await query.edit_message_text("❌ Ошибка при обновлении задачи")
-                    return
-            
-            await query.edit_message_text(
-                f"↩️ Задача <b>{task_title}</b> отмечена как невыполненная",
-                parse_mode='HTML'
-            )
-            
-            # Обновляем список задач
-            await show_tasks_management_from_plan_callback(query, context)
-        except Exception as e:
-            logger.error(f"Ошибка в plan_task_uncomplete_callback: {e}", exc_info=True)
-            try:
-                if update.callback_query:
-                    await update.callback_query.answer("❌ Произошла ошибка", show_alert=True)
-            except Exception:
-                pass
-    
-    async def plan_task_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Меню редактирования задачи: название или время"""
-        try:
-            query = update.callback_query
-            if not query:
-                return
-            await query.answer()
-            task_id = query.data.replace("plan_task_edit_", "")
-            user_id = query.from_user.id
-            tasks_module = context.application.bot_data.get('tasks_module')
-            if not tasks_module:
-                await query.edit_message_text("❌ Модуль задач недоступен")
-                return
-            task = None
-            if hasattr(tasks_module, 'get_user_task_by_id'):
-                try:
-                    task = tasks_module.get_user_task_by_id(str(user_id), task_id)
-                except Exception:
-                    pass
-            if not task and hasattr(tasks_module, 'get_user_tasks'):
-                tasks = tasks_module.get_user_tasks(str(user_id))
-                if isinstance(tasks, list):
-                    task = next((t for t in tasks if isinstance(t, dict) and t.get('id') == task_id), None)
-            if not task:
-                await query.answer("Задача не найдена", show_alert=True)
-                return
-            context.user_data['plan_edit_task_id'] = task_id
-            title = task.get('title', 'Без названия')
-            keyboard = [
-                [InlineKeyboardButton("📝 Изменить название", callback_data=f"plan_edit_title_{task_id}")],
-                [InlineKeyboardButton("📅 Перенести время", callback_data=f"plan_edit_deadline_{task_id}")],
-                [InlineKeyboardButton("◀️ Назад к списку", callback_data="plan_edit_back")]
-            ]
-            await query.edit_message_text(
-                f"Редактирование: <b>{title}</b>\n\nЧто изменить?",
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        except Exception as e:
-            logger.error(f"Ошибка в plan_task_edit_callback: {e}", exc_info=True)
-            try:
-                if update.callback_query:
-                    await update.callback_query.answer("❌ Ошибка", show_alert=True)
-            except Exception:
-                pass
-    
-    async def plan_edit_title_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Запрос нового названия задачи"""
-        try:
-            query = update.callback_query
-            if not query:
-                return
-            await query.answer()
-            task_id = query.data.replace("plan_edit_title_", "")
-            context.user_data['plan_edit_task_id'] = task_id
-            context.user_data['plan_waiting'] = 'plan_edit_title'
-            await query.edit_message_text("Введите новое название задачи:")
-        except Exception as e:
-            logger.error(f"Ошибка в plan_edit_title_prompt_callback: {e}", exc_info=True)
-    
-    async def plan_edit_deadline_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Запрос новой даты/времени"""
-        try:
-            query = update.callback_query
-            if not query:
-                return
-            await query.answer()
-            task_id = query.data.replace("plan_edit_deadline_", "")
-            context.user_data['plan_edit_task_id'] = task_id
-            context.user_data['plan_waiting'] = 'plan_edit_deadline'
-            await query.edit_message_text(
-                "Введите новую дату или время.\n\n"
-                "Например: завтра 18:00, вторник 14:00, 15.02.2026, послезавтра, через 2 дня"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка в plan_edit_deadline_prompt_callback: {e}", exc_info=True)
-    
-    async def plan_edit_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Назад из меню редактирования к списку задач"""
-        try:
-            query = update.callback_query
-            if not query:
-                return
-            await query.answer()
-            context.user_data.pop('plan_edit_task_id', None)
-            context.user_data.pop('plan_waiting', None)
-            await show_tasks_management_from_plan_callback(query, context)
-        except Exception as e:
-            logger.error(f"Ошибка в plan_edit_back_callback: {e}", exc_info=True)
-    
-    async def plan_task_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Удаление задачи из плана"""
-        try:
-            query = update.callback_query
-            if not query:
-                return
-            await query.answer()
-            task_id = query.data.replace("plan_task_delete_", "")
-            user_id = query.from_user.id
-            tasks_module = context.application.bot_data.get('tasks_module')
-            if not tasks_module:
-                await query.edit_message_text("❌ Модуль задач недоступен")
-                return
-            if hasattr(tasks_module, 'delete_user_task') and tasks_module.delete_user_task(str(user_id), task_id):
-                await show_tasks_management_from_plan_callback(query, context)
-            else:
-                await query.answer("Не удалось удалить задачу", show_alert=True)
-        except Exception as e:
-            logger.error(f"Ошибка в plan_task_delete_callback: {e}", exc_info=True)
-            try:
-                if update.callback_query:
-                    await update.callback_query.answer("❌ Ошибка при удалении", show_alert=True)
-            except Exception:
-                pass
-    
-    async def plan_edit_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка ввода нового названия или даты при редактировании задачи из плана"""
-        if not update.message or not update.message.text:
-            return
-        waiting = context.user_data.get('plan_waiting')
-        if waiting not in ('plan_edit_title', 'plan_edit_deadline'):
-            return
-        task_id = context.user_data.get('plan_edit_task_id')
-        if not task_id:
-            context.user_data.pop('plan_waiting', None)
-            return
-        user_id = update.effective_user.id
-        tasks_module = context.application.bot_data.get('tasks_module')
-        if not tasks_module or not hasattr(tasks_module, 'update_user_task'):
-            await update.message.reply_text("❌ Модуль задач недоступен")
-            context.user_data.pop('plan_waiting', None)
-            context.user_data.pop('plan_edit_task_id', None)
-            return
-        text = update.message.text.strip()
-        if not text:
-            await update.message.reply_text("Введите непустой текст.")
-            return
-        try:
-            if waiting == 'plan_edit_title':
-                tasks_module.update_user_task(str(user_id), task_id, {'title': text})
-                await update.message.reply_text(f"✅ Название изменено на: <b>{text}</b>", parse_mode='HTML')
-            else:
-                if hasattr(tasks_module, 'parse_deadline'):
-                    deadline_dt = tasks_module.parse_deadline(text, None)
-                else:
-                    deadline_dt = None
-                if deadline_dt is None:
-                    await update.message.reply_text(
-                        "Не удалось распознать дату/время. Попробуйте: завтра 18:00, 15.02.2026, послезавтра"
-                    )
-                    return
-                tasks_module.update_user_task(str(user_id), task_id, {'deadline': deadline_dt.isoformat()})
-                if hasattr(tasks_module, 'format_deadline_readable'):
-                    formatted = tasks_module.format_deadline_readable(deadline_dt)
-                else:
-                    formatted = deadline_dt.strftime('%d.%m.%Y %H:%M')
-                await update.message.reply_text(f"✅ Время изменено на: <b>{formatted}</b>", parse_mode='HTML')
-        except Exception as e:
-            logger.error(f"Ошибка при сохранении редактирования задачи: {e}", exc_info=True)
-            await update.message.reply_text("❌ Ошибка при сохранении.")
-        context.user_data.pop('plan_waiting', None)
-        context.user_data.pop('plan_edit_task_id', None)
-        # Отправляем обновлённый список задач
-        try:
-            tasks = tasks_module.get_user_tasks(str(user_id)) if hasattr(tasks_module, 'get_user_tasks') else []
-            if tasks:
-                msg_text = "<b>✅ Управление задачами</b>\n\nНажмите на задачу:\n\n"
-                keyboard = []
-                incomplete = [t for t in tasks if not t.get('completed', False)]
-                for i, task in enumerate(incomplete[:50], 1):
-                    title = task.get('title', 'Без названия')
-                    tid = task.get('id', '')
-                    deadline = task.get('deadline', '')
-                    project = task.get('project', '')
-                    btn = f"{i}. {title}"
-                    if deadline:
-                        try:
-                            if 'T' in deadline:
-                                dt = datetime.fromisoformat(deadline.replace('Z', '+00:00'))
-                                btn += f" ({dt.strftime('%d.%m %H:%M')})"
-                            else:
-                                dt = datetime.strptime(deadline, '%Y-%m-%d')
-                                btn += f" ({dt.strftime('%d.%m')})"
-                        except Exception:
-                            pass
-                    if project:
-                        btn += f" [{project}]"
-                    if len(btn) > 60:
-                        btn = btn[:57] + "..."
-                    keyboard.append([InlineKeyboardButton(btn, callback_data=f"plan_task_complete_{tid}")])
-                keyboard.append([InlineKeyboardButton("◀️ Назад к плану", callback_data="plan_back_to_plan")])
-                await update.message.reply_text(
-                    msg_text,
-                    parse_mode='HTML',
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-        except Exception as e:
-            logger.debug(f"Не удалось отправить список задач после редактирования: {e}")
-    
-    async def plan_back_to_tasks_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Возврат к списку задач из плана"""
-        try:
-            query = update.callback_query
-            if not query:
-                logger.warning("plan_back_to_tasks_callback вызван без callback_query")
-                return
-            
-            await query.answer()
-            
-            await show_tasks_management_from_plan_callback(query, context)
-        except Exception as e:
-            logger.error(f"Ошибка в plan_back_to_tasks_callback: {e}", exc_info=True)
-            try:
-                if update.callback_query:
-                    await update.callback_query.answer("❌ Произошла ошибка", show_alert=True)
-            except Exception:
-                pass
-    
-    async def show_tasks_management_from_plan_callback(query, context):
-        """Показать список задач для управления (для callback)"""
-        try:
-            if not query:
-                logger.warning("show_tasks_management_from_plan_callback вызван без query")
-                return
-            
-            user_id = query.from_user.id
-            tasks_module = context.application.bot_data.get('tasks_module')
-            
-            if not tasks_module:
-                await query.edit_message_text("❌ Модуль задач недоступен")
-                return
-            
-            # Получаем все задачи пользователя
-            tasks = []
-            if hasattr(tasks_module, 'get_user_tasks'):
-                try:
-                    tasks = tasks_module.get_user_tasks(str(user_id))
-                    if not isinstance(tasks, list):
-                        logger.warning(f"get_user_tasks вернул не список: {type(tasks)}")
-                        tasks = []
-                except Exception as e:
-                    logger.error(f"Ошибка при получении задач: {e}", exc_info=True)
-                    await query.edit_message_text("❌ Ошибка при получении задач")
-                    return
-            else:
-                await query.edit_message_text("❌ Не удалось получить задачи")
-                return
-            
-            if not tasks:
-                await query.edit_message_text(
-                    "📝 У вас пока нет задач.\n\nДобавьте задачи в разделе «Задачи»."
-                )
-                return
-            
-            # Формируем список задач с кнопками для отметки
-            text = "<b>✅ Управление задачами</b>\n\n"
-            text += "Нажмите на задачу: выполнить, редактировать (название или время) или вернуться.\n\n"
-            
-            keyboard = []
-            
-            # Показываем только невыполненные задачи
-            incomplete_tasks = [t for t in tasks if not t.get('completed', False)]
-            
-            for i, task in enumerate(incomplete_tasks[:50], 1):  # Ограничиваем до 50 задач
-                if not isinstance(task, dict):
-                    continue
-                
-                title = task.get('title', 'Без названия')
-                task_id = task.get('id', '')
-                deadline = task.get('deadline', '')
-                project = task.get('project', '')
-                
-                if not task_id:
-                    logger.warning(f"Задача без ID пропущена: {title}")
-                    continue
-                
-                # Формируем текст кнопки
-                button_text = f"{i}. {title}"
-                if deadline:
-                    try:
-                        from datetime import datetime
-                        if 'T' in deadline:
-                            deadline_dt = datetime.fromisoformat(deadline.replace('Z', '+00:00'))
-                            deadline_str = deadline_dt.strftime('%d.%m %H:%M')
-                        else:
-                            deadline_dt = datetime.strptime(deadline, '%Y-%m-%d')
-                            deadline_str = deadline_dt.strftime('%d.%m')
-                        button_text += f" ({deadline_str})"
-                    except (ValueError, AttributeError):
-                        pass
-                
-                if project:
-                    button_text += f" [{project}]"
-                
-                # Обрезаем текст кнопки, если слишком длинный
-                if len(button_text) > 60:
-                    button_text = button_text[:57] + "..."
-                
-                keyboard.append([InlineKeyboardButton(button_text, callback_data=f"plan_task_complete_{task_id}")])
-            
-            keyboard.append([InlineKeyboardButton("◀️ Назад к плану", callback_data="plan_back_to_plan")])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.edit_message_text(
-                text,
-                parse_mode='HTML',
-                reply_markup=reply_markup
-            )
-            
-        except Exception as e:
-            logger.error(f"Ошибка при показе управления задачами: {e}", exc_info=True)
-            try:
-                await query.edit_message_text("❌ Произошла ошибка при загрузке задач")
-            except Exception:
-                pass
-    
-    async def plan_back_to_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Возврат к плану из управления задачами"""
-        try:
-            query = update.callback_query
-            if not query:
-                logger.warning("plan_back_to_plan_callback вызван без callback_query")
-                return
-            
-            await query.answer()
-            
-            user_id = query.from_user.id
-            schedule_module = context.application.bot_data.get('schedule_module')
-            tasks_module = context.application.bot_data.get('tasks_module')
-            
-            # Показываем план на сегодня
-            events, tasks = get_combined_plan(user_id, schedule_module, tasks_module, days=1)
-            text = format_combined_plan_text(events, tasks, "сегодня")
-            
-            await query.edit_message_text(
-                text,
-                parse_mode='HTML',
-                reply_markup=None
-            )
-            
-            # Отправляем новое сообщение с клавиатурой плана
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text="Выберите период для просмотра плана:",
-                reply_markup=get_plan_keyboard()
-            )
-        except Exception as e:
-            logger.error(f"Ошибка в plan_back_to_plan_callback: {e}", exc_info=True)
-            try:
-                if update.callback_query:
-                    await update.callback_query.answer("❌ Произошла ошибка", show_alert=True)
-            except Exception:
-                pass
-    
-    async def plan_tasks_completed_header_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка заголовка выполненных задач (ничего не делаем)"""
-        try:
-            query = update.callback_query
-            if query:
-                await query.answer()
-        except Exception as e:
-            logger.error(f"Ошибка в plan_tasks_completed_header_callback: {e}", exc_info=True)
-    
-    # Регистрируем обработчики callback'ов для плана
-    application.add_handler(CallbackQueryHandler(
-        plan_task_complete_callback,
-        pattern='^plan_task_complete_'
-    ))
-    application.add_handler(CallbackQueryHandler(
-        plan_task_do_complete_callback,
-        pattern='^plan_task_do_complete_'
-    ))
-    application.add_handler(CallbackQueryHandler(
-        plan_task_confirm_yes_callback,
-        pattern='^plan_task_confirm_yes$'
-    ))
-    application.add_handler(CallbackQueryHandler(
-        plan_task_confirm_no_callback,
-        pattern='^plan_task_confirm_no$'
-    ))
-    application.add_handler(CallbackQueryHandler(
-        plan_task_edit_callback,
-        pattern='^plan_task_edit_'
-    ))
-    application.add_handler(CallbackQueryHandler(
-        plan_task_delete_callback,
-        pattern='^plan_task_delete_'
-    ))
-    application.add_handler(CallbackQueryHandler(
-        plan_edit_title_prompt_callback,
-        pattern='^plan_edit_title_'
-    ))
-    application.add_handler(CallbackQueryHandler(
-        plan_edit_deadline_prompt_callback,
-        pattern='^plan_edit_deadline_'
-    ))
-    application.add_handler(CallbackQueryHandler(
-        plan_edit_back_callback,
-        pattern='^plan_edit_back$'
-    ))
-    application.add_handler(CallbackQueryHandler(
-        plan_task_uncomplete_callback,
-        pattern='^plan_task_uncomplete_'
-    ))
-    application.add_handler(CallbackQueryHandler(
-        plan_back_to_tasks_callback,
-        pattern='^plan_back_to_tasks$'
-    ))
-    application.add_handler(CallbackQueryHandler(
-        plan_back_to_plan_callback,
-        pattern='^plan_back_to_plan$'
-    ))
-    application.add_handler(CallbackQueryHandler(
-        plan_tasks_completed_header_callback,
-        pattern='^plan_tasks_completed_header$'
-    ))
-    # Ввод названия/даты при редактировании задачи из плана (только когда ждём ввод)
-    class PlanEditWaitingFilter(filters.UpdateFilter):
-        def __init__(self, app, **kwargs):
-            super().__init__(**kwargs)
-            self._app = app
-        def filter(self, update):
-            if not update.message or not update.message.text or not update.effective_user:
-                return False
-            ud = self._app.user_data.get(update.effective_user.id, {})
-            return ud.get('plan_waiting') in ('plan_edit_title', 'plan_edit_deadline')
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & PlanEditWaitingFilter(application),
-        plan_edit_message_handler
-    ))
-    
-    # Обработчик ошибок
-    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработка ошибок"""
-        from telegram.error import Conflict, NetworkError, BadRequest
-        
-        import traceback
-        error = context.error
-        
-        # Игнорируем ошибку Conflict (когда запущено несколько экземпляров)
-        if isinstance(error, Conflict):
-            logger.warning("Conflict: Другой экземпляр бота уже запущен. Остановите другие экземпляры.")
-            logger.warning("Выполните: pkill -9 -f 'python3.*unified_bot.py'")
-            return
-        
-        # Игнорируем временные сетевые ошибки
-        if isinstance(error, NetworkError):
-            logger.warning(f"Сетевая ошибка (возможно временная): {error}")
-            return
-        
-        # Игнорируем некоторые BadRequest ошибки (например, сообщение уже отредактировано)
-        if isinstance(error, BadRequest):
-            error_msg = str(error)
-            if "message is not modified" in error_msg.lower() or "message to edit not found" in error_msg.lower():
-                logger.debug(f"BadRequest (можно игнорировать): {error}")
-                return
-        
-        # Для остальных ошибок выводим полную информацию
-        logger.error(f"ОШИБКА при обработке обновления: {type(error).__name__}: {error}", exc_info=True)
-        
-        # Пытаемся отправить сообщение пользователю только если это Update с сообщением
-        if isinstance(update, Update):
-            try:
-                if update.message:
-                    await update.message.reply_text(
-                        "❌ Произошла ошибка. Попробуйте позже или отправьте /start"
-                    )
-                elif update.callback_query:
-                    await update.callback_query.answer(
-                        "❌ Произошла ошибка. Попробуйте позже.",
-                        show_alert=True
-                    )
-            except Exception as e:
-                logger.error(f"Не удалось отправить сообщение об ошибке пользователю: {e}")
-    
-    application.add_error_handler(error_handler)
-    
-    logger.info("✅ Объединенный бот запущен!")
-    logger.info("✅ Все ConversationHandler зарегистрированы")
-    
-    try:
-        # Используем параметр для автоматического восстановления после Conflict
         application.run_polling(
             drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-            close_loop=False  # Не закрывать цикл при ошибках
+            allowed_updates=Update.ALL_TYPES
         )
+    except (NetworkError, TimedOut) as e:
+        print(f"\n❌ Ошибка сети при работе бота: {e}")
+        print("\n⚠️  Проблема с подключением к Telegram API.")
+        print("Возможные причины:")
+        print("1. Нет интернет-соединения")
+        print("2. Telegram API недоступен")
+        print("3. Проблемы с прокси/файрволом")
+        print("4. Неверный токен бота")
+        print("\nПопробуйте:")
+        print("- Проверить интернет-соединение")
+        print("- Проверить токен в файле .env")
+        print("- Запустить бота позже")
+        import sys
+        sys.exit(1)
     except KeyboardInterrupt:
-        logger.info("🛑 Бот остановлен пользователем (Ctrl+C)")
+        print("\n⏹️  Бот остановлен пользователем")
     except Exception as e:
-        from telegram.error import Conflict
-        if isinstance(e, Conflict):
-            logger.error("Conflict обнаружен при запуске. Убедитесь, что запущен только один экземпляр бота.")
-            logger.error("Выполните: pkill -9 -f 'python3.*unified_bot.py'")
-            logger.error("Затем запустите бота заново.")
-        else:
-            logger.error(f"Ошибка при запуске бота: {e}", exc_info=True)
+        error_type = type(e).__name__
+        error_msg = str(e)
+        print(f"\n❌ Ошибка при работе бота: {error_msg}")
+        print(f"Тип ошибки: {error_type}")
+        
+        # Проверяем, является ли это ошибкой подключения
+        if any(keyword in error_type for keyword in ["Connect", "Network", "Timeout", "Connection"]):
+            print("\n⚠️  Проблема с подключением к Telegram API.")
+            print("Возможные причины:")
+            print("1. Нет интернет-соединения")
+            print("2. Telegram API недоступен")
+            print("3. Проблемы с прокси/файрволом")
+            print("\nПопробуйте:")
+            print("- Проверить интернет-соединение")
+            print("- Запустить бота позже")
+        
+        import traceback
+        traceback.print_exc()
+        import sys
+        sys.exit(1)
+
 
 if __name__ == '__main__':
     main()
