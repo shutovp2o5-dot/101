@@ -14,6 +14,7 @@ import base64
 import aiohttp
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
+from pathlib import Path
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
@@ -108,6 +109,15 @@ except ImportError:
     print("   pip3 install SpeechRecognition pydub")
     print("   brew install ffmpeg")
 
+# Базовая директория для данных (можно переопределить через переменную окружения TASKS_DATA_DIR)
+DATA_DIR = os.environ.get('TASKS_DATA_DIR')
+if DATA_DIR:
+    DATA_DIR = Path(DATA_DIR)
+else:
+    # По умолчанию используем директорию, где лежит этот файл
+    DATA_DIR = Path(__file__).resolve().parent
+
+
 # Состояния для ConversationHandler
 (WAITING_TASK_TITLE, WAITING_TASK_COMMENT, WAITING_TASK_PROJECT, WAITING_TASK_DEADLINE, WAITING_TASK_REMINDER, WAITING_TASK_RECURRENCE, WAITING_TASK_CATEGORY) = range(7)
 (WAITING_PROJECT_NAME, WAITING_PROJECT_TYPE, WAITING_PROJECT_TARGET_TASKS, WAITING_PROJECT_PRIORITY, WAITING_PROJECT_END_DATE, WAITING_PROJECT_CATEGORY) = range(7, 13)
@@ -116,8 +126,34 @@ except ImportError:
 (WAITING_EDIT_PROJECT_TARGET_TASKS, WAITING_PROJECT_COMPLETE_CONFIRM, WAITING_EDIT_PROJECT_NAME) = range(23, 26)
 
 # Файл для хранения данных
-DATA_FILE = 'tasks_data.json'
+DATA_FILE = str(DATA_DIR / 'tasks_data.json')
+BACKUP_FILE = f"{DATA_FILE}.bak"
 
+
+def atomic_write_with_backup(file_path: str, data: Dict) -> None:
+    """Безопасная запись JSON с созданием .bak-резерва перед перезаписью"""
+    from pathlib import Path as _Path
+    import shutil as _shutil
+    tmp_path = f"{file_path}.tmp"
+    backup_path = f"{file_path}.bak"
+
+    path = _Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Делаем резервную копию текущего файла (если есть)
+    if path.exists():
+        try:
+            _shutil.copy2(path, backup_path)
+        except Exception:
+            # Если бэкап не удался, не мешаем основному сохранению
+            pass
+
+    # Пишем во временный файл и атомарно заменяем основной
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, file_path)
 
 
 def capitalize_first(text: str) -> str:
@@ -497,25 +533,84 @@ async def transcribe_voice(voice_file, update: Update = None) -> Optional[str]:
 
 def load_data() -> Dict:
     """Загрузка данных из файла"""
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            return {'users': {}, 'projects': {}}
-    return {'users': {}, 'projects': {}}
+    if not os.path.exists(DATA_FILE):
+        return {'users': {}, 'projects': {}}
+
+    try:
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        # Пытаемся восстановить из .bak, если основной файл повреждён
+        if os.path.exists(BACKUP_FILE):
+            try:
+                with open(BACKUP_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {'users': {}, 'projects': {}}
+    except Exception:
+        return {'users': {}, 'projects': {}}
 
 
 def save_data(data: Dict):
     """Сохранение данных в файл"""
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    atomic_write_with_backup(DATA_FILE, data)
 
 
 def get_user_tasks(user_id: str) -> List[Dict]:
     """Получение задач пользователя"""
     data = load_data()
-    return data.get('users', {}).get(str(user_id), {}).get('tasks', [])
+    tasks = data.get('users', {}).get(str(user_id), {}).get('tasks', [])
+    
+    # Помечаем просроченные задачи (только в оперативных данных, без немедленной записи)
+    now_dt = now()
+    if now_dt.tzinfo:
+        now_dt = now_dt.replace(tzinfo=None)
+    
+    for task in tasks:
+        if task.get('completed'):
+            continue
+        deadline_str = task.get('deadline')
+        if not deadline_str:
+            continue
+        try:
+            from datetime import datetime as _dt
+            deadline_dt = _dt.fromisoformat(deadline_str)
+            if deadline_dt.tzinfo:
+                deadline_dt = deadline_dt.replace(tzinfo=None)
+            task['overdue'] = deadline_dt < now_dt
+        except Exception:
+            # Если дедлайн некорректный, не помечаем задачу
+            continue
+
+    # Сортируем задачи по времени исполнения (дедлайн), без дедлайна — в конце
+    from datetime import datetime as _dt
+
+    def _task_sort_key(t: Dict):
+        deadline_str = t.get('deadline')
+        if deadline_str:
+            try:
+                dt = _dt.fromisoformat(deadline_str)
+                if dt.tzinfo:
+                    dt = dt.replace(tzinfo=None)
+            except Exception:
+                dt = _dt.max
+        else:
+            dt = _dt.max
+
+        created_str = t.get('created_at')
+        if created_str:
+            try:
+                created = _dt.fromisoformat(created_str)
+            except Exception:
+                created = _dt.max
+        else:
+            created = _dt.max
+
+        return (dt, created)
+
+    tasks.sort(key=_task_sort_key)
+    return tasks
 
 
 def get_user_projects(user_id: str) -> List[str]:
@@ -3806,7 +3901,22 @@ async def show_projects_summary_from_menu(update: Update, context: ContextTypes.
     # Завершенные проекты
     if completed_projects:
         text += "\n<b>Завершенные проекты:</b>\n"
-        for project_name, project_data in completed_projects:
+        # Сортируем завершенные проекты по дате окончания (если есть), затем по названию
+        from datetime import datetime as _dt
+
+        def _completed_sort_key(item):
+            name, pdata = item
+            end_date = pdata.get('end_date')
+            if end_date:
+                try:
+                    dt = _dt.strptime(end_date, '%Y-%m-%d')
+                except Exception:
+                    dt = _dt.max
+            else:
+                dt = _dt.max
+            return (dt, name.lower())
+
+        for project_name, project_data in sorted(completed_projects, key=_completed_sort_key):
             text += f"<s>{project_name}</s>\n"
     
     await update.message.reply_text(text, parse_mode='HTML')
@@ -3918,7 +4028,22 @@ async def show_projects_summary(query, context: ContextTypes.DEFAULT_TYPE):
     # Выполненные проекты
     if completed_projects:
         text += "<b>Завершенные проекты:</b>\n"
-        for project_name, project_data in completed_projects:
+        # Сортируем завершенные проекты по дате окончания (если есть), затем по названию
+        from datetime import datetime as _dt
+
+        def _completed_sort_key(item):
+            name, pdata = item
+            end_date = pdata.get('end_date')
+            if end_date:
+                try:
+                    dt = _dt.strptime(end_date, '%Y-%m-%d')
+                except Exception:
+                    dt = _dt.max
+            else:
+                dt = _dt.max
+            return (dt, name.lower())
+
+        for project_name, project_data in sorted(completed_projects, key=_completed_sort_key):
             text += f"<s>{project_name}</s>\n"
         text += "\n"
     
@@ -4564,11 +4689,13 @@ async def stats_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_tasks = len(tasks)
     completed_tasks = sum(1 for t in tasks if t.get('completed'))
     incomplete_tasks = total_tasks - completed_tasks
+    overdue_tasks = sum(1 for t in tasks if not t.get('completed') and t.get('overdue'))
     
     text = "<b>Статистика</b>\n\n"
     text += f"Всего задач: {total_tasks}\n"
     text += f"Выполнено: {completed_tasks}\n"
     text += f"Осталось: {incomplete_tasks}\n"
+    text += f"Просрочено: {overdue_tasks}\n"
     text += f"Проектов: {len(projects)}\n"
     text += f"Категорий: {len(categories)}\n"
     
