@@ -15,6 +15,9 @@ from datetime import datetime, time
 # Базовая директория проекта
 BASE_DIR = Path(__file__).resolve().parent
 
+# Директория для пользовательских данных (можно переопределить через DATA_DIR)
+DATA_DIR = Path(os.environ.get('DATA_DIR', BASE_DIR))
+
 # Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -669,8 +672,8 @@ async def unified_choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE
                     schedule_module.save_user_event(str(user_id), event)
                 else:
                     # fallback: напрямую работаем с файлом schedule_data.json
-                    import json, os
-                    data_file = os.path.join(os.path.dirname(__file__), 'schedule_data.json')
+                    import json
+                    data_file = DATA_DIR / 'schedule_data.json'
                     if os.path.exists(data_file):
                         with open(data_file, 'r', encoding='utf-8') as f:
                             data = json.load(f)
@@ -679,6 +682,8 @@ async def unified_choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE
                     user_events = data.get(str(user_id), [])
                     user_events.append(event)
                     data[str(user_id)] = user_events
+                    # Гарантируем существование директории данных
+                    data_file.parent.mkdir(parents=True, exist_ok=True)
                     with open(data_file, 'w', encoding='utf-8') as f:
                         json.dump(data, f, ensure_ascii=False, indent=2)
                 
@@ -719,8 +724,8 @@ async def unified_choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE
                     tasks_module.save_user_task(str(user_id), task)
                 else:
                     # fallback: прямое сохранение в tasks_data.json
-                    import json, os
-                    data_file = os.path.join(os.path.dirname(__file__), 'tasks_data.json')
+                    import json
+                    data_file = DATA_DIR / 'tasks_data.json'
                     if os.path.exists(data_file):
                         with open(data_file, 'r', encoding='utf-8') as f:
                             data = json.load(f)
@@ -729,6 +734,8 @@ async def unified_choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE
                     users = data.setdefault('users', {})
                     user_data = users.setdefault(str(user_id), {'tasks': [], 'projects': [], 'tags': [], 'projects_data': {}})
                     user_data.setdefault('tasks', []).append(task)
+                    # Гарантируем существование директории данных
+                    data_file.parent.mkdir(parents=True, exist_ok=True)
                     with open(data_file, 'w', encoding='utf-8') as f:
                         json.dump(data, f, ensure_ascii=False, indent=2)
                 
@@ -3222,8 +3229,9 @@ def main():
         
         # Очищаем данные задач/проектов в tasks_data.json
         try:
-            tasks_path = str(BASE_DIR / 'tasks_data.json')
+            tasks_path = str(DATA_DIR / 'tasks_data.json')
             if os.path.exists(tasks_path):
+                # Загружаем текущие данные
                 with open(tasks_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 users = data.get('users', {})
@@ -3233,6 +3241,15 @@ def main():
                     users[user_id]['tags'] = []
                     users[user_id]['projects_data'] = {}
                 data['users'] = users
+
+                # Делаем .bak перед перезаписью
+                import shutil as _shutil
+                backup_path = f"{tasks_path}.bak"
+                try:
+                    _shutil.copy2(tasks_path, backup_path)
+                except Exception:
+                    pass
+
                 with open(tasks_path, 'w', encoding='utf-8') as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -3240,12 +3257,21 @@ def main():
         
         # Очищаем события в schedule_data.json
         try:
-            schedule_path = str(BASE_DIR / 'schedule_data.json')
+            schedule_path = str(DATA_DIR / 'schedule_data.json')
             if os.path.exists(schedule_path):
                 with open(schedule_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 if user_id in data:
                     data[user_id] = []
+
+                # Бэкап перед перезаписью
+                import shutil as _shutil
+                backup_path = f"{schedule_path}.bak"
+                try:
+                    _shutil.copy2(schedule_path, backup_path)
+                except Exception:
+                    pass
+
                 with open(schedule_path, 'w', encoding='utf-8') as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -3253,12 +3279,21 @@ def main():
         
         # Очищаем shared_projects.json (совместные проекты)
         try:
-            shared_path = str(BASE_DIR / 'shared_projects.json')
+            shared_path = str(DATA_DIR / 'shared_projects.json')
             if os.path.exists(shared_path):
                 with open(shared_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 if user_id in data:
                     data[user_id] = {}
+
+                # Бэкап перед перезаписью
+                import shutil as _shutil
+                backup_path = f"{shared_path}.bak"
+                try:
+                    _shutil.copy2(shared_path, backup_path)
+                except Exception:
+                    pass
+
                 with open(shared_path, 'w', encoding='utf-8') as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -3267,8 +3302,8 @@ def main():
         # Очищаем вспомогательные файлы с сообщениями (если есть)
         try:
             for path in [
-                str(BASE_DIR / 'user_messages.json'),
-                str(BASE_DIR / 'user_sent_messages.json')
+                str(DATA_DIR / 'user_messages.json'),
+                str(DATA_DIR / 'user_sent_messages.json')
             ]:
                 if os.path.exists(path):
                     try:
@@ -3276,6 +3311,14 @@ def main():
                             data = json.load(f)
                         if isinstance(data, dict) and user_id in data:
                             data.pop(user_id, None)
+                            # Бэкап перед перезаписью
+                            import shutil as _shutil
+                            backup_path = f"{path}.bak"
+                            try:
+                                _shutil.copy2(path, backup_path)
+                            except Exception:
+                                pass
+
                             with open(path, 'w', encoding='utf-8') as f:
                                 json.dump(data, f, ensure_ascii=False, indent=2)
                     except Exception:
